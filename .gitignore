@@ -1,1 +1,4 @@
-
+.streamlit/secrets.toml
+*.png
+state.json
+__pycache__/
