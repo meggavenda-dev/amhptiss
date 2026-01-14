@@ -232,14 +232,11 @@ if st.button("🚀 Iniciar Processo (PDF)"):
             driver.switch_to.window(driver.window_handles[-1])
 
         st.success("Automação iniciada.")
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
-            if tentativa > MAX_RETRIES:
-                st.error(f"❌ Falha definitiva: {e}")
-                break
+finally:
+    try:
+        driver.quit()
+    except Exception:
+        pass
 
 # ========= PDF → Tabela =========
 def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "text", debug: bool = False) -> pd.DataFrame:
