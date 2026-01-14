@@ -1,5 +1,37 @@
 
 # -*- coding: utf-8 -*-
+"""
+AMHP - Exportador PDF + Consolidador
+
+Fluxo:
+1) Automatiza login e navegação no AMHPTISS.
+2) Exporta relatório de Atendimentos em PDF.
+3) Lê o PDF aplicando a mesma lógica da “Tabela — Atendimentos”.
+4) Sanitiza, acrescenta metadados (Status/Negociação/Período) e consolida em memória.
+5) Permite baixar um CSV consolidado com múltiplos Status/Períodos.
+
+Requisitos (requirements.txt):
+streamlit
+pandas
+selenium
+PyPDF2
+pdfplumber
+lxml
+beautifulsoup4
+(openpyxl/xlsxwriter são opcionais aqui)
+
+Para Streamlit Cloud (packages.txt — sem comentários):
+chromium
+chromium-driver
+libnss3
+libxss1
+libasound2
+libatk-bridge2.0-0
+libgtk-3-0
+libgbm1
+fonts-liberation
+"""
+
 import os
 import io
 import re
@@ -32,7 +64,7 @@ try:
     if driver_bin_secret:
         os.environ["CHROMEDRIVER_BINARY"] = driver_bin_secret
 except Exception:
-    pass
+    pass  # Execução local sem secrets de env
 
 # ========= CONFIG DA PÁGINA =========
 st.set_page_config(page_title="AMHP - Exportador PDF + Consolidação", layout="wide")
@@ -152,92 +184,215 @@ def switch_to_iframe_safe(driver, timeout=20, iframe_locator=None, index_fallbac
     except TimeoutException:
         pass
 
-# ========= PARSE DE PDF → DATAFRAME =========
-def parse_pdf_to_df(pdf_path: str) -> pd.DataFrame:
+# ========= PARSE DE PDF → DATAFRAME (Tabela — Atendimentos) =========
+def parse_pdf_to_atendimentos_df(pdf_path: str) -> pd.DataFrame:
     """
-    Tenta extrair tabelas via pdfplumber; se não houver, faz fallback lendo texto com PyPDF2.
-    Ajusta cabeçalho dinamicamente procurando termos 'Atendimento' e 'Guia'.
+    Extrai a Tabela — Atendimentos de um PDF do AMHPTISS/SSRS.
+    1) Tenta via PyPDF2 (texto), usando regex e heurísticas.
+    2) Se não conseguir, tenta via pdfplumber (tabelas) e normaliza para o mesmo esquema.
+    Retorna DataFrame com colunas:
+       ['Atendimento','NrGuia','Realizacao','Hora','TipoGuia',
+        'Operadora','Matricula','Beneficiario','Credenciado','Prestador','ValorTotal']
     """
-    df_final = pd.DataFrame()
+    val_re = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}$")  # valor monetário pt-BR
+    code_name_re = re.compile(r"\d{3,6}-[^\d].+?")      # bloco "CODIGO-Nome" p/ credenciado/prestador
 
-    # 1) Tenta com pdfplumber (tabelas)
+    # ---------- 1) PyPDF2 (texto) ----------
     try:
-        import pdfplumber  # requer 'pdfplumber' no requirements.txt
+        from PyPDF2 import PdfReader
+        reader = PdfReader(open(pdf_path, "rb"))
+        lines = []
+        for page in reader.pages:
+            txt = page.extract_text() or ""
+            txt = txt.replace("\u00A0", " ")
+            lines.extend([l.strip() for l in txt.splitlines() if l.strip()])
+
+        # Localiza linha de cabeçalho (contém 'Atendimento' e 'Valor Total')
+        hdr_idx = -1
+        for i, l in enumerate(lines):
+            if ("Atendimento" in l) and ("Valor" in l) and ("Total" in l):
+                hdr_idx = i
+                break
+        if hdr_idx == -1:
+            hdr_idx = 0  # fallback simples
+
+        # Percorre até a linha 'Total R$ ...'
+        data_lines = []
+        for l in lines[hdr_idx+1:]:
+            if l.startswith("Total "):
+                break
+            data_lines.append(l)
+
+        parsed_rows = []
+        for l in data_lines:
+            # 1) Valor no fim da linha
+            m_val = val_re.search(l)
+            if not m_val:
+                continue
+            valor = m_val.group(0)
+            body = l[:m_val.start()].strip()
+
+            # 2) Captura Prestador (último "CODIGO-Nome") e Credenciado (penúltimo)
+            code_names = list(code_name_re.finditer(body))
+            prestador = code_names[-1].group(0) if code_names else ""
+            if code_names:
+                body = body[:code_names[-1].start()].strip()
+            credenciado = code_names[-2].group(0) if len(code_names) >= 2 else ""
+            if len(code_names) >= 2:
+                body = body[:code_names[-2].start()].strip()
+
+            # 3) Cabeçalho fixo: Atendimento, NrGuia, Data, Hora
+            m_head = re.match(r"^(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+(.*)$", body)
+            if not m_head:
+                continue
+            atendimento, nr_guia, realizacao, hora, rest = m_head.groups()
+
+            # 4) Rest: TipoGuia + Operadora + Matrícula + Beneficiário
+            toks = rest.split()
+
+            def is_numeric_token(t):
+                return re.fullmatch(r"\d+", t) is not None
+
+            # início da matrícula
+            idx_mat = None
+            for i, t in enumerate(toks):
+                if is_numeric_token(t):
+                    idx_mat = i
+                    break
+            if idx_mat is None:
+                for i, t in enumerate(toks):
+                    if re.fullmatch(r"\d{6,}", t):
+                        idx_mat = i
+                        break
+
+            if idx_mat is None:
+                tipo_guia = toks[0]
+                operadora = " ".join(toks[1:]).strip()
+                matricula = ""
+                beneficiario = ""
+            else:
+                # TipoGuia pode ter 2 tokens (ex.: "SP/SADT PMDF")
+                if "/" in toks[0] and idx_mat >= 2 and re.fullmatch(r"[A-ZÁÉÍÓÚÂÊÔÃÕÇ\-]{2,15}", toks[1]):
+                    tipo_tokens = toks[0:2]
+                    start_oper = 2
+                else:
+                    tipo_tokens = toks[0:1]
+                    start_oper = 1
+                tipo_guia = " ".join(tipo_tokens)
+                operadora = " ".join(toks[start_oper:idx_mat]).strip()
+                j = idx_mat
+                mat_tokens = []
+                while j < len(toks) and is_numeric_token(toks[j]):
+                    mat_tokens.append(toks[j])
+                    j += 1
+                matricula = " ".join(mat_tokens)
+                beneficiario = " ".join(toks[j:]).strip()
+
+            parsed_rows.append({
+                "Atendimento": atendimento,
+                "NrGuia": nr_guia,
+                "Realizacao": realizacao,
+                "Hora": hora,
+                "TipoGuia": tipo_guia,
+                "Operadora": operadora,
+                "Matricula": matricula,
+                "Beneficiario": beneficiario,
+                "Credenciado": credenciado,
+                "Prestador": prestador,
+                "ValorTotal": valor,
+            })
+
+        df = pd.DataFrame(parsed_rows)
+        if not df.empty:
+            # Ordena por data/hora
+            try:
+                df["Realizacao_dt"] = pd.to_datetime(df["Realizacao"], format="%d/%m/%Y")
+                df = df.sort_values(["Realizacao_dt", "Hora"]).drop(columns=["Realizacao_dt"])
+            except Exception:
+                pass
+            # Sanitiza e retorna
+            df = sanitize_df(df)
+            return df
+
+    except Exception:
+        pass  # continua no fallback
+
+    # ---------- 2) pdfplumber (tabela com linhas desenhadas) ----------
+    try:
+        import pdfplumber
         tables_concat = []
         with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages:
-                # Se a tabela tiver linhas/desenho, pdfplumber detecta bastante bem
                 tbls = page.extract_tables()
                 for tbl in tbls:
-                    # tbl é uma lista de linhas (listas de células)
                     if tbl and len(tbl) > 1:
                         tables_concat.append(pd.DataFrame(tbl))
         if tables_concat:
             df_temp = pd.concat(tables_concat, ignore_index=True)
-            # Detecta linha de cabeçalho dinamicamente
+            # encontra linha do cabeçalho
             header_idx = -1
             for i, row in df_temp.iterrows():
                 row_str = " ".join([str(v).replace("\u00A0", " ") for v in row.values])
-                if "Atendimento" in row_str and "Guia" in row_str:
+                if ("Atendimento" in row_str) and ("Valor" in row_str) and ("Total" in row_str):
                     header_idx = i
                     break
             if header_idx == -1:
                 header_idx = 0
+
+            # aplica cabeçalho
             df = df_temp.iloc[header_idx+1:].copy()
-            df.columns = df_temp.iloc[header_idx].astype(str).tolist()
-            # Limpeza
-            df = df.loc[:, df.columns.notnull()]
-            df = df.dropna(how="all", axis=1).dropna(how="all", axis=0)
-            df_final = df
+            header = df_temp.iloc[header_idx].astype(str).tolist()
+            df.columns = header[:len(df.columns)]
+
+            # mapeia nomes para o esquema final
+            def pick(df_cols, candidates):
+                for c in candidates:
+                    if c in df_cols:
+                        return c
+                return None
+
+            col_map = {
+                "Atendimento": pick(df.columns, ["Atendimento","Nr Atendimento","Nº Atendimento"]),
+                "NrGuia": pick(df.columns, ["Nr. Guia","Nr Guia","Nº Guia","Nº da Guia Operadora"]),
+                "Realizacao": pick(df.columns, ["Realização","Realizacao","Data"]),
+                "Hora": pick(df.columns, ["Hora"]),
+                "TipoGuia": pick(df.columns, ["Tipo de Guia","Tipo de Guia:","Tipo"]),
+                "Operadora": pick(df.columns, ["Operadora"]),
+                "Matricula": pick(df.columns, ["Matrícula","Matricula"]),
+                "Beneficiario": pick(df.columns, ["Beneficiário","Beneficiario","Nome do Beneficiário"]),
+                "Credenciado": pick(df.columns, ["Credenciado","Prestador Credenciado"]),
+                "Prestador": pick(df.columns, ["Prestador"]),
+                "ValorTotal": pick(df.columns, ["Valor Total","Valor","Total"]),
+            }
+
+            rows_norm = []
+            for _, r in df.iterrows():
+                rows_norm.append({
+                    "Atendimento": str(r.get(col_map["Atendimento"], "")).strip(),
+                    "NrGuia": str(r.get(col_map["NrGuia"], "")).strip(),
+                    "Realizacao": str(r.get(col_map["Realizacao"], "")).strip(),
+                    "Hora": str(r.get(col_map["Hora"], "")).strip(),
+                    "TipoGuia": str(r.get(col_map["TipoGuia"], "")).strip(),
+                    "Operadora": str(r.get(col_map["Operadora"], "")).strip(),
+                    "Matricula": str(r.get(col_map["Matricula"], "")).strip(),
+                    "Beneficiario": str(r.get(col_map["Beneficiario"], "")).strip(),
+                    "Credenciado": str(r.get(col_map["Credenciado"], "")).strip(),
+                    "Prestador": str(r.get(col_map["Prestador"], "")).strip(),
+                    "ValorTotal": str(r.get(col_map["ValorTotal"], "")).strip(),
+                })
+
+            df_out = pd.DataFrame(rows_norm)
+            df_out = sanitize_df(df_out)
+            return df_out
+
     except Exception:
         pass
 
-    # 2) Fallback com PyPDF2: extrai texto e faz parsing por linhas
-    if df_final.empty:
-        try:
-            from PyPDF2 import PdfReader
-            reader = PdfReader(open(pdf_path, "rb"))
-            text_all = []
-            for page in reader.pages:
-                txt = page.extract_text() or ""
-                text_all.append(txt)
-            text = "\n".join(text_all)
-
-            # Normaliza espaços, tenta encontrar bloco onde aparece cabeçalho
-            lines = [l.strip() for l in text.splitlines() if l.strip()]
-            # Descobre índice de cabeçalho
-            header_idx = -1
-            for i, l in enumerate(lines):
-                nl = l.replace("\u00A0", " ")
-                if "Atendimento" in nl and "Guia" in nl:
-                    header_idx = i
-                    break
-            if header_idx == -1:
-                # Se não encontrou, tenta heurística: primeira linha longa
-                header_idx = 0
-
-            header_line = lines[header_idx].replace("\u00A0", " ")
-            # Divide por múltiplos espaços
-            cols = re.split(r"\s{2,}", header_line)
-            rows = []
-            for l in lines[header_idx+1:]:
-                r = re.split(r"\s{2,}", l.replace("\u00A0", " "))
-                # mantemos somente linhas com quantidade próxima de colunas
-                if len(r) >= max(2, int(0.6 * len(cols))):
-                    rows.append(r[:len(cols)])
-
-            df_text = pd.DataFrame(rows, columns=cols[:len(rows[0])] if rows else cols)
-            # Remoção de colunas vazias
-            df_text = df_text.loc[:, df_text.columns.notnull()]
-            df_text = df_text.dropna(how="all", axis=1).dropna(how="all", axis=0)
-
-            df_final = df_text
-        except Exception as e:
-            st.warning(f"Fallback de texto no PDF falhou: {e}")
-
-    # Sanitiza
-    df_final = sanitize_df(df_final)
-    return df_final
+    # Se nada deu certo, retorna dataframe vazio com esquema final
+    return pd.DataFrame(columns=[
+        "Atendimento","NrGuia","Realizacao","Hora","TipoGuia","Operadora",
+        "Matricula","Beneficiario","Credenciado","Prestador","ValorTotal"
+    ])
 
 # ========= UI =========
 with st.sidebar:
@@ -281,7 +436,6 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                 btn_tiss = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'AMHPTISS')]")))
                 driver.execute_script("arguments[0].click();", btn_tiss)
             except Exception:
-                # Fallback: tentar qualquer coisa com 'TISS'
                 elems = driver.find_elements(By.XPATH, "//*[contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'TISS')]")
                 if elems:
                     driver.execute_script("arguments[0].click();", elems[0])
@@ -369,9 +523,9 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                     shutil.move(recente, destino_pdf)
                     st.success(f"✅ PDF salvo: {destino_pdf}")
 
-                    # Lê PDF → DataFrame
+                    # Lê PDF → DataFrame (Tabela — Atendimentos)
                     st.write("📄 Lendo dados do PDF...")
-                    df_pdf = parse_pdf_to_df(destino_pdf)
+                    df_pdf = parse_pdf_to_atendimentos_df(destino_pdf)
 
                     if not df_pdf.empty:
                         # Metadados de filtro
@@ -379,6 +533,22 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                         df_pdf["Filtro_Status"] = sanitize_value(status_sel)
                         df_pdf["Periodo_Inicio"] = sanitize_value(data_ini)
                         df_pdf["Periodo_Fim"] = sanitize_value(data_fim)
+
+                        # Total do PDF atual (somatório dos valores)
+                        def to_float_br(s):
+                            try:
+                                return float(str(s).replace('.', '').replace(',', '.'))
+                            except Exception:
+                                return 0.0
+                        total_pdf = df_pdf["ValorTotal"].apply(to_float_br).sum()
+                        total_pdf_br = f"R$ {total_pdf:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                        st.info(f"📑 Total do PDF atual: **{total_pdf_br}**")
+
+                        # Preview formatado (colunas principais)
+                        cols_show = ["Atendimento","NrGuia","Realizacao","Hora","TipoGuia",
+                                     "Operadora","Matricula","Beneficiario","Credenciado",
+                                     "Prestador","ValorTotal"]
+                        st.dataframe(df_pdf[cols_show], use_container_width=True)
 
                         # Consolida no “banco” temporário
                         st.session_state.db_consolidado = pd.concat(
@@ -408,8 +578,9 @@ if st.button("🚀 Iniciar Processo (PDF)"):
     except Exception as e:
         st.error(f"Erro detectado: {e}")
         try:
-            driver.save_screenshot(os.path.join(PASTA_FINAL, "erro_interceptado.png"))
-            st.image(os.path.join(PASTA_FINAL, "erro_interceptado.png"))
+            shot = os.path.join(PASTA_FINAL, "erro_interceptado.png")
+            driver.save_screenshot(shot)
+            st.image(shot, caption="Screenshot do erro")
         except Exception:
             pass
     finally:
