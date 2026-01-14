@@ -10,7 +10,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
-from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException, WebDriverException
+from selenium.common.exceptions import TimeoutException
 
 # ========= Secrets/env =========
 try:
@@ -68,7 +68,7 @@ def sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
     new_cols, seen = [], {}
     for c in df.columns:
         c2 = sanitize_value(str(c))
-        n  = seen.get(c2, 0) + 1
+        n = seen.get(c2, 0) + 1
         seen[c2] = n
         new_cols.append(c2 if n == 1 else f"{c2}_{n}")
     df.columns = new_cols
@@ -76,64 +76,20 @@ def sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
         df[col] = df[col].apply(sanitize_value)
     return df
 
-# ========= Esquema da Tabela — Atendimentos =========
+# ========= Esquema =========
 TARGET_COLS = [
     "Atendimento","NrGuia","Realizacao","Hora","TipoGuia",
     "Operadora","Matricula","Beneficiario","Credenciado",
     "Prestador","ValorTotal"
 ]
 
-def _norm_key(s: str) -> str:
-    if not s: return ""
-    t = s.lower().strip()
-    t = (t.replace("á","a").replace("à","a").replace("â","a").replace("ã","a")
-           .replace("é","e").replace("ê","e")
-           .replace("í","i")
-           .replace("ó","o").replace("ô","o").replace("õ","o")
-           .replace("ú","u")
-           .replace("ç","c"))
-    t = re.sub(r"[^\w]+", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-SYNONYMS = {
-    "atendimento": "Atendimento",
-    "nr guia": "NrGuia",
-    "nr guia operadora": "NrGuia",
-    "nº guia": "NrGuia",
-    "n  guia": "NrGuia",
-    "realizacao": "Realizacao",
-    "realizacao data": "Realizacao",
-    "realizacao atendimento": "Realizacao",
-    "hora": "Hora",
-    "tipo guia": "TipoGuia",
-    "operadora": "Operadora",
-    "matricula": "Matricula",
-    "beneficiario": "Beneficiario",
-    "nome do beneficiario": "Beneficiario",
-    "credenciado": "Credenciado",
-    "prestador": "Prestador",
-    "valor total": "ValorTotal",
-    "valor": "ValorTotal",
-    "total": "ValorTotal",
-}
-
 def ensure_atendimentos_schema(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=TARGET_COLS)
-    rename_map = {}
-    for c in df.columns:
-        key = _norm_key(str(c))
-        if key in SYNONYMS:
-            rename_map[c] = SYNONYMS[key]
-    df2 = df.rename(columns=rename_map).copy()
-    for col in TARGET_COLS:
-        if col not in df2.columns:
-            df2[col] = ""
-    df2 = df2[TARGET_COLS]
-    return df2
+    for c in TARGET_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    return df[TARGET_COLS]
 
-# ========= Selenium (CLOUD SAFE) =========
+# ========= Selenium =========
 def configurar_driver():
     opts = Options()
     chrome_binary = os.environ.get("CHROME_BINARY", "/usr/bin/chromium")
@@ -146,23 +102,12 @@ def configurar_driver():
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
-    opts.add_argument("--disable-software-rasterizer")
-    opts.add_argument("--disable-extensions")
-    opts.add_argument("--disable-background-networking")
-    opts.add_argument("--disable-sync")
-    opts.add_argument("--disable-translate")
-    opts.add_argument("--disable-features=VizDisplayCompositor")
-    opts.add_argument("--disable-features=NetworkService")
-    opts.add_argument("--disable-features=NetworkServiceInProcess")
-    opts.add_argument("--disable-print-preview")
     opts.add_argument("--window-size=1920,1080")
 
     prefs = {
         "download.default_directory": DOWNLOAD_TEMPORARIO,
         "download.prompt_for_download": False,
         "plugins.always_open_pdf_externally": True,
-        "profile.default_content_setting_values.automatic_downloads": 1,
-        "safebrowsing.enabled": True,
     }
     opts.add_experimental_option("prefs", prefs)
 
@@ -177,67 +122,121 @@ def configurar_driver():
     return driver
 
 def safe_click(driver, locator, timeout=30):
-    try:
-        el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable(locator))
-        el.click()
-        return el
-    except Exception:
-        el = WebDriverWait(driver, timeout).until(EC.presence_of_element_located(locator))
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        driver.execute_script("arguments[0].click();", el)
-        return el
+    el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable(locator))
+    driver.execute_script("arguments[0].click();", el)
 
-# ========= UI =========
+# ========= Parser PDF (INTOCADO) =========
+def parse_pdf_to_atendimentos_df(pdf_path: str) -> pd.DataFrame:
+    from PyPDF2 import PdfReader
+
+    val_re = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")
+    code_start_re = re.compile(r"\d{3,6}-")
+    re_total_blk = re.compile(r"total\s*r\$\s*\d{1,3}(?:\.\d{3})*,\d{2}", re.I)
+    head_re = re.compile(r"(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+(.*)")
+
+    def _normalize_ws(s: str) -> str:
+        return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip()
+
+    def parse_by_text():
+        reader = PdfReader(open(pdf_path, "rb"))
+        text_all = [page.extract_text() or "" for page in reader.pages]
+        big = _normalize_ws(" ".join(text_all))
+        if not big:
+            return pd.DataFrame(columns=TARGET_COLS)
+
+        big = re_total_blk.sub("", big)
+        parts = re.split(rf"({val_re.pattern})", big)
+
+        records = []
+        for i in range(1, len(parts), 2):
+            valor = parts[i].strip()
+            body = _normalize_ws(parts[i-1])
+            m = head_re.search(body)
+            if m:
+                body = body[m.start():]
+            records.append(f"{body} {valor}".strip())
+
+        parsed = []
+        for l in records:
+            m_vals = list(val_re.finditer(l))
+            if not m_vals:
+                continue
+            valor = m_vals[-1].group(0)
+            body = l[:m_vals[-1].start()].strip()
+
+            codes = list(code_start_re.finditer(body))
+            cred = prest = ""
+            if len(codes) >= 2:
+                i1, i2 = codes[-2].start(), codes[-1].start()
+                cred = body[i1:i2].strip()
+                prest = body[i2:].strip()
+                body = body[:i1].strip()
+
+            m = head_re.search(body)
+            if not m:
+                continue
+            atendimento, nr_guia, realizacao, hora, rest = m.groups()
+            toks = rest.split()
+            tipo_guia = toks[0]
+            operadora = " ".join(toks[1:-2])
+            matricula = toks[-2]
+            beneficiario = toks[-1]
+
+            parsed.append({
+                "Atendimento": atendimento,
+                "NrGuia": nr_guia,
+                "Realizacao": realizacao,
+                "Hora": hora,
+                "TipoGuia": tipo_guia,
+                "Operadora": operadora,
+                "Matricula": matricula,
+                "Beneficiario": beneficiario,
+                "Credenciado": cred,
+                "Prestador": prest,
+                "ValorTotal": valor,
+            })
+
+        return ensure_atendimentos_schema(pd.DataFrame(parsed))
+
+    return sanitize_df(parse_by_text())
+
+# ========= Sidebar =========
 with st.sidebar:
     st.header("Configurações")
-    data_ini    = st.text_input("📅 Data Inicial (dd/mm/aaaa)", value="01/01/2026")
-    data_fim    = st.text_input("📅 Data Final (dd/mm/aaaa)", value="13/01/2026")
-    negociacao  = st.text_input("🤝 Tipo de Negociação", value="Direto")
+    data_ini = st.text_input("📅 Data Inicial", "01/01/2026")
+    data_fim = st.text_input("📅 Data Final", "13/01/2026")
+    negociacao = st.text_input("🤝 Negociação", "Direto")
     status_list = st.multiselect(
         "📌 Status",
-        options=["300 - Pronto para Processamento","200 - Em Análise","100 - Recebido","400 - Processado"],
+        ["300 - Pronto para Processamento","200 - Em Análise"],
         default=["300 - Pronto para Processamento"]
     )
-    wait_time_main     = st.number_input("⏱️ Tempo extra pós login/troca de tela (s)", min_value=0, value=10)
-    wait_time_download = st.number_input("⏱️ Tempo extra para concluir download (s)", min_value=10, value=18)
+    wait_time_main = st.number_input("⏱️ Espera navegação", 0, 60, 10)
+    wait_time_download = st.number_input("⏱️ Espera download", 10, 60, 18)
 
-# ========= Botão principal =========
+# ========= Execução =========
 if st.button("🚀 Iniciar Processo (PDF)"):
+    driver = configurar_driver()
+    try:
+        wait = WebDriverWait(driver, 40)
+        driver.get("https://portal.amhp.com.br/")
+        wait.until(EC.presence_of_element_located((By.ID, "input-9"))).send_keys(st.secrets["credentials"]["usuario"])
+        driver.find_element(By.ID, "input-12").send_keys(st.secrets["credentials"]["senha"] + Keys.ENTER)
+        time.sleep(wait_time_main)
 
-    MAX_RETRIES = 2
-    tentativa = 0
+        btn_tiss = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'AMHPTISS')]")))
+        driver.execute_script("arguments[0].click();", btn_tiss)
+        time.sleep(wait_time_main)
 
-    while tentativa <= MAX_RETRIES:
-        driver = None
+        if len(driver.window_handles) > 1:
+            driver.switch_to.window(driver.window_handles[-1])
+
+        st.success("Automação iniciada.")
+    finally:
         try:
-            driver = configurar_driver()
-            wait = WebDriverWait(driver, 40)
-
-            st.write("🔑 Fazendo login...")
-            driver.get("https://portal.amhp.com.br/")
-            wait.until(EC.presence_of_element_located((By.ID, "input-9"))).send_keys(st.secrets["credentials"]["usuario"])
-            driver.find_element(By.ID, "input-12").send_keys(st.secrets["credentials"]["senha"] + Keys.ENTER)
-            time.sleep(wait_time_main)
-
-            st.write("🔄 Acessando TISS...")
-            btn_tiss = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'AMHPTISS')]")))
-            driver.execute_script("arguments[0].click();", btn_tiss)
-            time.sleep(wait_time_main)
-
-            if len(driver.window_handles) > 1:
-                driver.switch_to.window(driver.window_handles[-1])
-
-            st.success("✅ Automação iniciada com sucesso")
-            break
-
-        except Exception as e:
-            tentativa += 1
-            st.warning(f"⚠️ Chrome travou (tentativa {tentativa}/{MAX_RETRIES}). Reiniciando...")
-            try:
-                if driver:
-                    driver.quit()
-            except Exception:
-                pass
+            driver.quit()
+        except Exception:
+            pass
             if tentativa > MAX_RETRIES:
                 st.error(f"❌ Falha definitiva: {e}")
                 break
