@@ -185,14 +185,14 @@ def safe_click(driver, locator, timeout=30):
 # ========= PDF → Tabela (coordenadas + fallback textual) =========
 def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool = False) -> pd.DataFrame:
     """
-    mode: "coord" (coordenadas, padrão) | "text" (fallback textual forçado)
+    mode: "coord" (coordenadas) | "text" (fallback textual)
     Sempre aplica ensure_atendimentos_schema() antes de retornar.
     """
     import pdfplumber
     from PyPDF2 import PdfReader
 
-    # Tolerâncias
-    TOP_TOL      = 4.5     # ↑ um pouco para PDFs do SSRS
+    # Tolerâncias (ajustáveis)
+    TOP_TOL      = 4.5
     MERGE_GAP_X  = 10.0
     COL_MARGIN   = 4.0
 
@@ -210,7 +210,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                 if not words:
                     continue
 
-                # 1) Cabeçalho
+                # Cabeçalho
                 header_y = None
                 header_words = []
                 for w in words:
@@ -238,7 +238,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                                 st.info(f"[coord] extract_tables usado na página {page_i}.")
                     continue
 
-                # 2) Blocos do cabeçalho
+                # Blocos do cabeçalho
                 blocks = []
                 cur = [header_words[0]]
                 for w in header_words[1:]:
@@ -255,7 +255,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                     "x1": max([b["x1"] for b in bl]),
                 } for bl in blocks]
 
-                def map_block(txt):
+                def map_block(txt: str):
                     t = txt.lower()
                     if "atendimento" in t:                   return "Atendimento"
                     if "nr" in t and "guia" in t:            return "NrGuia"
@@ -277,20 +277,21 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                         columns.append({"name": name, "x0": hb["x0"], "x1": hb["x1"]})
                 columns = sorted(columns, key=lambda c: c["x0"])
                 if not columns:
-                    if debug: st.warning("Nenhuma coluna mapeada a partir do cabeçalho.")
+                    if debug:
+                        st.warning("Nenhuma coluna mapeada a partir do cabeçalho.")
                     continue
 
                 if debug:
                     st.info(f"[coord] Colunas detectadas (página {page_i}): {[c['name'] for c in columns]}")
 
-                # 3) Palavras de dados; corta 'Total'
+                # Palavras de dados (abaixo do cabeçalho) e corte antes de "Total"
                 data_words = [w for w in words if w["top"] > header_y + TOP_TOL]
                 total_candidates = [w for w in data_words if w["text"].lower() == "total"]
                 if total_candidates:
                     total_y = total_candidates[0]["top"]
                     data_words = [w for w in data_words if w["top"] < total_y - TOP_TOL]
 
-                # 4) Bandas (linhas)
+                # Bandas horizontais (linhas)
                 rows = []
                 band = []
                 last_top = None
@@ -301,9 +302,8 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                         rows.append(band); band = [w]; last_top = w["top"]
                 if band: rows.append(band)
 
-                # 5) Atribuição de palavras à coluna por centro mais próximo (mais robusto)
+                # Atribuição por centro mais próximo
                 col_centers = [(c["name"], (c["x0"] + c["x1"]) / 2.0) for c in columns]
-
                 def assign_to_nearest_col(w):
                     wc = (w["x0"] + w["x1"]) / 2.0
                     name, dist = None, 1e9
@@ -316,19 +316,18 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                     bucket = {c["name"]: [] for c in columns}
                     for w in row_words:
                         cname = assign_to_nearest_col(w)
-                        # extra: se estiver muito fora (nenhuma coluna “próxima”), usa interseção com margem
+                        # fallback por interseção se nada próximo
                         if cname is None:
                             for c in columns:
                                 intersects = not (w["x1"] < (c["x0"] - COL_MARGIN) or w["x0"] > (c["x1"] + COL_MARGIN))
                                 if intersects:
                                     cname = c["name"]; break
-                        if cname is None:  # se ainda não caiu em nenhuma, ignora
+                        if cname is None:
                             continue
                         bucket[cname].append(w)
 
                     cols_text = {k: " ".join([ww["text"] for ww in sorted(v, key=lambda z: z["x0"])]) for k, v in bucket.items()}
 
-                    # precisa ter ValorTotal válido
                     if not cols_text.get("ValorTotal") or not val_re.search(cols_text["ValorTotal"]):
                         continue
 
@@ -356,10 +355,6 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                         "ValorTotal":    cols_text.get("ValorTotal","").strip(),
                     })
 
-                if debug and all_records:
-                    st.caption(f"[coord] Amostra da última linha (página {page_i}):")
-                    st.write(all_records[-1])
-
         out = pd.DataFrame(all_records)
         if not out.empty:
             try:
@@ -377,14 +372,14 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
             txt = txt.replace("\u00A0", " ")
             lines.extend([l.strip() for l in txt.splitlines() if l.strip()])
 
-        # cabeçalho
+        # Cabeçalho
         hdr_idx = -1
         for i, l in enumerate(lines):
             if ("Atendimento" in l) and ("Valor" in l) and ("Total" in l):
                 hdr_idx = i; break
         if hdr_idx == -1: hdr_idx = 0
 
-        # linhas até 'Total'
+        # Linhas até 'Total'
         data_lines = []
         for l in lines[hdr_idx+1:]:
             if l.lower().startswith("total "):
@@ -474,7 +469,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
     if mode == "text":
         return sanitize_df(parse_by_text())
 
-    # Tenta coordenadas; se vazio, força fallback textual
+    # Tenta coordenadas; se vazio, cai no textual
     out = parse_by_coords()
     if out.empty:
         if debug: st.warning("Nenhuma linha por coordenadas — aplicando fallback textual.")
@@ -494,7 +489,8 @@ with st.sidebar:
     )
     wait_time_main     = st.number_input("⏱️ Tempo extra pós login/troca de tela (s)", min_value=0, value=10)
     wait_time_download = st.number_input("⏱️ Tempo extra para concluir download (s)", min_value=10, value=18)
-    extraction_mode    = st.selectbox("🧠 Modo de extração do PDF", ["Coordenadas (recomendado)", "Texto (fallback)"])
+    # Apenas visual — a chamada do parser será forçada para "text"
+    extraction_mode    = st.selectbox("🧠 Modo de extração do PDF (visual)", ["Coordenadas (recomendado)", "Texto (fallback)"])
     debug_parser       = st.checkbox("🧪 Debug do parser PDF", value=False)
 
 # ========= (Opcional) Processar PDF manualmente =========
@@ -504,12 +500,12 @@ with st.expander("🧪 Testar parser com upload de PDF (sem automação)", expan
         tmp_pdf = os.path.join(DOWNLOAD_TEMPORARIO, "teste_upload.pdf")
         with open(tmp_pdf, "wb") as f:
             f.write(up.getvalue())
-        mode = "text" if extraction_mode.startswith("Texto") else "coord"
-        df_test = parse_pdf_to_atendimentos_df(tmp_pdf, mode=mode, debug=debug_parser)
+        # Força TEXTUAL mesmo no teste
+        df_test = parse_pdf_to_atendimentos_df(tmp_pdf, mode="text", debug=debug_parser)
         if df_test.empty:
-            st.error("Parser não conseguiu extrair linhas deste PDF. Ajuste tolerâncias ou use o outro modo.")
+            st.error("Parser não conseguiu extrair linhas deste PDF usando o modo textual.")
         else:
-            st.success(f"{len(df_test)} linha(s) extraída(s).")
+            st.success(f"{len(df_test)} linha(s) extraída(s) pelo modo textual.")
             st.dataframe(df_test, use_container_width=True)
 
 # ========= Botão principal =========
@@ -606,8 +602,8 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                     st.success(f"✅ PDF salvo: {destino_pdf}")
 
                     st.write("📄 Extraindo Tabela — Atendimentos do PDF...")
-                    mode = "text" if extraction_mode.startswith("Texto") else "coord"
-                    df_pdf = parse_pdf_to_atendimentos_df(destino_pdf, mode=mode, debug=debug_parser)
+                    # >>> FORÇANDO MODO TEXTUAL (seletor da UI é apenas visual)
+                    df_pdf = parse_pdf_to_atendimentos_df(destino_pdf, mode="text", debug=debug_parser)
 
                     if not df_pdf.empty:
                         # Metadados
@@ -630,7 +626,7 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                         st.session_state.db_consolidado = pd.concat([st.session_state.db_consolidado, df_pdf], ignore_index=True)
                         st.write(f"📊 Registros acumulados: {len(st.session_state.db_consolidado)}")
                     else:
-                        st.warning("⚠️ Não foi possível extrair linhas do PDF. Tente o outro modo de extração e/ou ajuste tolerâncias.")
+                        st.warning("⚠️ Modo textual não conseguiu extrair linhas. Envie o PDF pelo expander de teste para analisarmos.")
 
                     try:
                         driver.switch_to.default_content()
