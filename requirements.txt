@@ -6,3 +6,4 @@ xlsxwriter
 openpyxl
 lxml
 beautifulsoup4
+pdfplumber
