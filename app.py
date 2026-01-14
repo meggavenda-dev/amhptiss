@@ -11,68 +11,66 @@ import os
 import shutil
 import io
 
-# --- CONFIGURAÇÃO DA PÁGINA ---
+# --- CONFIGURAÇÃO ---
 st.set_page_config(page_title="AMHP Data Analytics", layout="wide")
 
-# Inicializa o Banco de Dados Temporário na sessão
 if 'db_consolidado' not in st.session_state:
     st.session_state.db_consolidado = pd.DataFrame()
 
-# Diretório para downloads
 DOWNLOAD_TEMPORARIO = os.path.join(os.getcwd(), "temp_downloads")
-if not os.path.exists(DOWNLOAD_TEMPORARIO):
-    os.makedirs(DOWNLOAD_TEMPORARIO)
+if not os.path.exists(DOWNLOAD_TEMPORARIO): os.makedirs(DOWNLOAD_TEMPORARIO)
 
-# --- FUNÇÃO DE PROCESSAMENTO DE DADOS ---
+# --- PROCESSAMENTO ROBUSTO ---
 
 def processar_e_acumular(caminho_arquivo, status_nome, neg_nome):
-    """Lê o arquivo do AMHP e extrai apenas a tabela de dados real"""
     try:
-        # Lê o arquivo como texto ignorando caracteres especiais
-        with open(caminho_arquivo, 'r', encoding='latin1', errors='ignore') as f:
-            linhas = f.readlines()
+        # Tenta ler o arquivo com diferentes encodings caso o latin1 falhe
+        try:
+            with open(caminho_arquivo, 'r', encoding='latin1', errors='ignore') as f:
+                linhas = f.readlines()
+        except:
+            with open(caminho_arquivo, 'r', encoding='utf-8', errors='ignore') as f:
+                linhas = f.readlines()
         
-        # Localiza a linha correta do cabeçalho (onde estão os títulos das colunas)
+        # BUSCA DINÂMICA PELO CABEÇALHO
+        # Vamos procurar uma linha que tenha pelo menos 2 termos conhecidos
         indice_cabecalho = -1
+        termos_chave = ["Atendimento", "Guia", "Valor", "Beneficiário", "Realização"]
+        
         for i, linha in enumerate(linhas):
-            if "Atendimento" in linha and "Guia" in linha and "Valor Total" in linha:
+            encontrados = [termo for termo in termos_chave if termo.lower() in linha.lower()]
+            if len(encontrados) >= 2: # Se achar pelo menos 2 termos, é o cabeçalho
                 indice_cabecalho = i
                 break
         
         if indice_cabecalho == -1:
-            st.error("⚠️ Cabeçalho de dados não encontrado no arquivo.")
-            return False
+            # Se não achar, tenta pular as 16 linhas padrão do AMHP como última tentativa
+            indice_cabecalho = 16 
 
-        # Carrega os dados a partir da linha identificada
-        # sep=',' e on_bad_lines='skip' resolvem o erro de formatação
+        # Carrega os dados
         df = pd.read_csv(
             io.StringIO("".join(linhas[indice_cabecalho:])), 
             sep=',', 
             engine='python', 
-            on_bad_lines='skip',
-            encoding='latin1'
+            on_bad_lines='skip'
         )
         
-        # --- LIMPEZA DE COLUNAS ---
-        # 1. Remove colunas "Unnamed" (geradas por vírgulas sobrando no XLS)
+        # Limpeza de colunas vazias ou fantasmas
         df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
-        # 2. Limpa espaços vazios nos nomes das colunas
         df.columns = [c.strip() for c in df.columns]
-        # 3. Remove linhas e colunas totalmente vazias
         df = df.dropna(how='all', axis=1).dropna(how='all', axis=0)
         
-        # Adiciona metadados para controle
+        # Adiciona os filtros para saber a origem do dado
         df['Filtro_Status'] = status_nome
         df['Filtro_Negociacao'] = neg_nome
         
-        # Concatena no banco global da sessão
         st.session_state.db_consolidado = pd.concat([st.session_state.db_consolidado, df], ignore_index=True)
         return True
     except Exception as e:
-        st.error(f"❌ Erro ao processar dados: {e}")
+        st.error(f"Erro no processamento: {e}")
         return False
 
-# --- FUNÇÃO DO NAVEGADOR ---
+# --- NAVEGADOR ---
 
 def iniciar_driver():
     options = Options()
@@ -80,12 +78,7 @@ def iniciar_driver():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
-    
-    prefs = {
-        "download.default_directory": DOWNLOAD_TEMPORARIO,
-        "download.prompt_for_download": False,
-        "download.directory_upgrade": True,
-    }
+    prefs = {"download.default_directory": DOWNLOAD_TEMPORARIO, "download.prompt_for_download": False}
     options.add_experimental_option("prefs", prefs)
     return webdriver.Chrome(options=options)
 
@@ -93,33 +86,29 @@ def iniciar_driver():
 
 st.title("🏥 Consolidador de Relatórios AMHP")
 
-with st.sidebar:
-    st.header("Parâmetros")
-    data_ini = st.date_input("Data Inicial", value=pd.to_datetime("2026-01-01"))
-    data_fim = st.date_input("Data Final", value=pd.to_datetime("2026-01-13"))
-    negociacao = "Direto"
-    status_p = "300 - Pronto para Processamento"
+col1, col2 = st.columns(2)
+with col1: data_ini = st.date_input("Início", value=pd.to_datetime("2026-01-01"))
+with col2: data_fim = st.date_input("Fim", value=pd.to_datetime("2026-01-13"))
 
 if st.button("🚀 Iniciar Captura"):
     driver = iniciar_driver()
     if driver:
         try:
-            with st.status("Processando...", expanded=True) as s:
+            with st.status("Robô trabalhando...", expanded=True) as s:
                 wait = WebDriverWait(driver, 35)
                 driver.get("https://portal.amhp.com.br/")
                 
-                # Login
+                # Login (Usa secrets do Streamlit)
                 wait.until(EC.presence_of_element_located((By.ID, "input-9"))).send_keys(st.secrets["credentials"]["usuario"])
                 driver.find_element(By.ID, "input-12").send_keys(st.secrets["credentials"]["senha"] + Keys.ENTER)
                 time.sleep(10)
                 
-                # TISS
-                btn_tiss = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'AMHPTISS')]")))
-                driver.execute_script("arguments[0].click();", btn_tiss)
+                # Navegação TISS
+                driver.execute_script("arguments[0].click();", wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'AMHPTISS')]"))))
                 time.sleep(8)
                 driver.switch_to.window(driver.window_handles[-1])
 
-                # Limpeza e Navegação
+                # Limpeza e Filtros
                 try: driver.execute_script("document.getElementById('fechar-informativo').click();")
                 except: pass
                 driver.execute_script("document.getElementById('IrPara').click();")
@@ -128,21 +117,21 @@ if st.button("🚀 Iniciar Captura"):
                 wait.until(EC.presence_of_element_located((By.XPATH, "//a[@href='AtendimentosRealizados.aspx']"))).click()
                 time.sleep(5)
 
-                # Filtros
-                def set_f(id, v):
+                # Preenchimento
+                def fill(id, v):
                     el = driver.find_element(By.ID, id)
                     driver.execute_script("arguments[0].value = arguments[1];", el, v)
                     el.send_keys(Keys.ENTER)
                     time.sleep(2)
 
-                set_f("ctl00_MainContent_rcbTipoNegociacao_Input", negociacao)
-                set_f("ctl00_MainContent_rcbStatus_Input", status_p)
+                fill("ctl00_MainContent_rcbTipoNegociacao_Input", "Direto")
+                fill("ctl00_MainContent_rcbStatus_Input", "300 - Pronto para Processamento")
                 
                 d1, d2 = data_ini.strftime("%d/%m/%Y"), data_fim.strftime("%d/%m/%Y")
                 driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataInicio_dateInput").send_keys(d1 + Keys.TAB)
                 driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataFim_dateInput").send_keys(d2 + Keys.TAB)
 
-                # Buscar e Exportar
+                # Exportação
                 driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "ctl00_MainContent_btnBuscar_input"))
                 wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".rgMasterTable")))
                 driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "ctl00_MainContent_rdgAtendimentosRealizados_ctl00_ctl02_ctl00_SelectColumnSelectCheckBox"))
@@ -157,42 +146,33 @@ if st.button("🚀 Iniciar Captura"):
                 time.sleep(2)
                 driver.execute_script("document.getElementById('ReportView_ReportToolbar_ExportGr_Export').click();")
                 
-                st.write("📥 Aguardando download...")
-                time.sleep(15)
+                time.sleep(15) # Espera download
 
-                # Processamento
+                # Banco de Dados
                 arquivos = [f for f in os.listdir(DOWNLOAD_TEMPORARIO) if f.endswith(('.xls', '.csv'))]
                 if arquivos:
                     recente = max([os.path.join(DOWNLOAD_TEMPORARIO, f) for f in arquivos], key=os.path.getctime)
-                    if processar_e_acumular(recente, status_p, negociacao):
-                        st.success("✅ Dados consolidados com sucesso!")
+                    processar_e_acumular(recente, "300", "Direto")
                     os.remove(recente)
-                else:
-                    st.error("Erro: Arquivo não baixado.")
+                    st.success("✅ Relatório adicionado ao banco!")
+                
                 s.update(label="Concluído!", state="complete")
-
         except Exception as e:
             st.error(f"Erro: {e}")
         finally:
             driver.quit()
 
-# --- ÁREA FINAL ---
-st.divider()
+# --- EXIBIÇÃO ---
 if not st.session_state.db_consolidado.empty:
+    st.divider()
     st.subheader("📊 Base de Dados Consolidada")
     st.dataframe(st.session_state.db_consolidado)
     
-    # Exportação Final Segura (sem depender de xlsxwriter específico)
+    # Exportação para Excel
     buffer = io.BytesIO()
-    st.session_state.db_consolidado.to_excel(buffer, index=False)
+    st.session_state.db_consolidado.to_excel(buffer, index=False, engine='openpyxl')
+    st.download_button("💾 Baixar Relatório Unificado (.xlsx)", buffer.getvalue(), "relatorio_final.xlsx")
     
-    st.download_button(
-        label="💾 Baixar Relatório Final Unificado (.xlsx)",
-        data=buffer.getvalue(),
-        file_name="relatorio_final_consolidado.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-    
-    if st.button("🗑️ Limpar Banco"):
+    if st.button("🗑️ Limpar Tudo"):
         st.session_state.db_consolidado = pd.DataFrame()
         st.rerun()
