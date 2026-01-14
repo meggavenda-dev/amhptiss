@@ -135,105 +135,44 @@ def ensure_atendimentos_schema(df: pd.DataFrame) -> pd.DataFrame:
     df2 = df2[TARGET_COLS]
     return df2
 
-# ========= Regex e Parser de TEXTO (ReportViewer) — utilitários =========
+# ========= Regex compartilhados =========
 val_re        = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")  # valor pt-BR
-# FLEXÍVEL: aceita data e hora coladas e não exige espaço após a hora
-head_re       = re.compile(r"(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s*(\d{2}:\d{2})(.*)")
 code_start_re = re.compile(r"\d{3,6}-")
 re_total_blk  = re.compile(r"total\s*r\$\s*\d{1,3}(?:\.\d{3})*,\d{2}", re.I)
+HDR_ANY       = re.compile(r"(\d{6,})(?:\s+(\d{6,}))?\s*(\d{2}/\d{2}/\d{4})\s*(\d{2}:\d{2})")
 
+# ========= Helpers comuns =========
 def _normalize_ws2(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").replace("\u00A0", " ")).strip()
-
-# ---------- PRÉ-LIMPEZA ROBUSTA DO TEXTO ----------
-def _preclean_report_text(raw: str) -> str:
-    """
-    - Corta preâmbulo (filtros) e pula o cabeçalho (começa após 'Valor Total').
-    - Insere espaços entre tokens colados:
-      • dois blocos numéricos longos (Atendimento e NrGuia),
-      • Data↔Hora,
-      • Hora↔TipoGuia,
-      • TipoGuia↔Operadora,
-      • ')'↔Matrícula,
-      • Matrícula (bloco numérico) ↔ Nome (letra inicial).
-    - Normaliza escapes (\, \(, \)) e whitespace.
-    """
-    if not raw:
-        return ""
-    txt = raw.replace("\u00A0", " ")
-    txt = _ILLEGAL_CTRL_RE.sub("", txt)
-
-    # Normaliza escapes vindos do ReportViewer
-    txt = txt.replace(r"\-", "-").replace(r"\(", "(").replace(r"\)", ")")  # NEW
-
-    # Inserir espaço entre dois blocos numéricos longos colados
-    txt = re.sub(r"(\d{6,})(\d{6,})", r"\1 \2", txt)
-
-    # Espaço entre Data e Hora coladas
-    txt = re.sub(r"(\d{2}/\d{2}/\d{4})(\d{2}:\d{2})", r"\1 \2", txt)
-
-    # Espaço entre Hora e próximo token alfabético (Tipo de Guia)
-    txt = re.sub(r"(\d{2}:\d{2})(?=[A-Za-zÁ-Úá-úNÇS/])", r"\1 ", txt)
-
-    # Espaço entre Tipo de Guia e Operadora coladas
-    txt = re.sub(r'(?i)\b(Consulta)(?=[A-ZÁ-Ú])', r'\1 ', txt)
-    txt = re.sub(r'(?i)\b(SP/SADT)(?=[A-ZÁ-Ú])', r'\1 ', txt)
-    txt = re.sub(r'(?i)\b(Honorário(?:\s*Individual)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', txt)
-    txt = re.sub(r'(?i)\b(Não(?:\s*TISS)?(?:\s*-\s*Atendimento)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', txt)
-    txt = re.sub(r"(Consulta|SP/SADT)(?=[A-Z]{2,}\()", r"\1 ", txt)
-
-    # Espaço entre ')' e matrícula coladas
-    txt = re.sub(r"(\))(\d{5,})", r"\1 \2", txt)
-
-    # NEW: Espaço entre matrícula (bloco numérico longo) e início do nome (letra)
-    txt = re.sub(r"(\d{5,})([A-ZÁ-Ú])", r"\1 \2", txt)
-
-    # Corta antes/até o cabeçalho e começa APÓS 'Valor Total'
-    m = re.search(r"(Atendimento\s*Nr\.?\s*Guia.*?Valor\s*Total)", txt, flags=re.I|re.S)
-    if m:
-        txt = txt[m.end():]  # começa logo depois do cabeçalho
-    else:
-        # fallback: primeira ocorrência de dois números + data + hora
-        m2 = re.search(r"\d{6,}\s+\d{6,}\s+\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}", txt)
-        if m2:
-            txt = txt[m2.start():]
-
-    return _normalize_ws2(txt)
 
 def is_mat_token(t: str) -> bool:
     if re.fullmatch(r"\d{5,}", t):
         return True
     return bool(re.fullmatch(r"[0-9A-Z]{5,}", t))
 
+# ========= (LEGADOS) Parser tradicional e PDF (mantidos) =========
+# -- (a) Parser legado por texto (mantido para fallback/inspeção) --
+head_re = re.compile(r"(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s*(\d{2}:\d{2})(.*)")
+
 def split_tipo_operadora(tokens):
     if not tokens:
         return "", [], 0
-    t0 = tokens[0]
-    t0low = t0.lower()
-
-    # Se já tem '/', tratar colagem: SP/SADTBACEN → SP/SADT + BACEN
+    t0 = tokens[0]; t0low = t0.lower()
     if "/" in t0:
         if t0low.startswith("sp/sadt") and t0low != "sp/sadt":
             rest0 = t0[len("SP/SADT"):]
             tail  = ([rest0] if rest0 else []) + tokens[1:]
             return "SP/SADT", tail, 1
         return t0, tokens[1:], 1
-
-    # ConsultaGDF / ConsultaOMINT / ConsultaCONAB...
     if t0low.startswith("consulta") and t0low != "consulta":
         rest0 = t0[len("Consulta"):]
         tail  = ([rest0] if rest0 else []) + tokens[1:]
         return "Consulta", tail, 1
-
-    # Demais tipos conhecidos
     if t0low in ("consulta", "sp/sadt", "honorário", "honorário individual",
                  "não", "não tiss", "não tiss - atendimento"):
         return tokens[0], tokens[1:], 1
-
-    # Default: 1º token é o tipo
     return tokens[0], tokens[1:], 1
 
-# ---------- Parser legado (mantido para toggle) ----------
 def parse_record_text(rec: str):
     rec = _normalize_ws2(rec)
     rec = re_total_blk.sub("", rec)
@@ -263,7 +202,7 @@ def parse_record_text(rec: str):
         return None
     atendimento, nr_guia, realizacao, hora, rest = m_head.groups()
 
-    # Patches de colagem
+    # patches
     rest = re.sub(r'(?i)\b(Consulta)(?=[A-ZÁ-Ú])', r'\1 ', rest)
     rest = re.sub(r'(?i)\b(SP/SADT)(?=[A-ZÁ-Ú])', r'\1 ', rest)
     rest = re.sub(r'(?i)\b(Honorário(?:\s*Individual)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', rest)
@@ -307,22 +246,15 @@ def parse_record_text(rec: str):
     }
 
 def parse_relatorio_text_to_atendimentos_df(texto: str, debug_heads: bool = False) -> pd.DataFrame:
-    """
-    Parser principal (antigo):
-    0) Pré-limpeza
-    1) Split por valor + 1º cabeçalho interno
-    2) Fallback streaming por cabeçalhos e último valor
-    """
-    big = _preclean_report_text(texto or "")
+    big = (texto or "").replace("\u00A0"," ")
+    big = _ILLEGAL_CTRL_RE.sub("", big)
+    m = re.search(r"(Atendimento\s*Nr\.?\s*Guia.*?Valor\s*Total)", big, flags=re.I|re.S)
+    if m:
+        big = big[m.end():]
+    big = re_total_blk.sub("", big)
     if not big:
         return pd.DataFrame(columns=TARGET_COLS)
-    big = re_total_blk.sub("", big)
 
-    if debug_heads:
-        heads_test = list(head_re.finditer(big))
-        st.caption(f"🧩 Cabeçalhos detectados (pré-limpeza): {len(heads_test)}")
-
-    # Estratégia 1
     parts = re.split(rf"({val_re.pattern})", big)
     records = []
     for i in range(1, len(parts), 2):
@@ -353,356 +285,17 @@ def parse_relatorio_text_to_atendimentos_df(texto: str, debug_heads: bool = Fals
             pass
         return ensure_atendimentos_schema(sanitize_df(out))
 
-    # Estratégia 2
-    heads = list(head_re.finditer(big))
-    if debug_heads:
-        st.caption(f"🧩 Cabeçalhos detectados (streaming): {len(heads)}")
-    if not heads:
-        return pd.DataFrame(columns=TARGET_COLS)
-
-    parsed2 = []
-    for idx, m in enumerate(heads):
-        start = m.start()
-        end   = heads[idx+1].start() if (idx + 1) < len(heads) else len(big)
-        segment = big[start:end].strip()
-
-        vals = list(val_re.finditer(segment))
-        if not vals:
-            ext_end = min(len(big), end + max(200, int(0.1 * len(segment))))
-            segment_ext = big[start:ext_end]
-            vals = list(val_re.finditer(segment_ext))
-            if not vals:
-                continue
-            val_end_idx = vals[-1].end()
-            rec = segment_ext[:val_end_idx]
-        else:
-            val_end_idx = vals[-1].end()
-            rec = segment[:val_end_idx]
-
-        row = parse_record_text(rec)
-        if row:
-            parsed2.append(row)
-
-    out2 = pd.DataFrame(parsed2)
-    if not out2.empty:
-        try:
-            out2["Realizacao_dt"] = pd.to_datetime(out2["Realizacao"], format="%d/%m/%Y", errors="coerce")
-            out2 = out2.sort_values(["Realizacao_dt","Hora"]).drop(columns=["Realizacao_dt"])
-        except Exception:
-            pass
-        return ensure_atendimentos_schema(sanitize_df(out2))
-
     return pd.DataFrame(columns=TARGET_COLS)
 
-def to_float_br(s):
-    try:
-        return float(str(s).replace('.', '').replace(',', '.'))
-    except Exception:
-        return 0.0
-
-# ========= NOVO PARSER UNIFICADO (streaming) — AJUSTADO =========
-def parse_streaming_any(texto: str) -> pd.DataFrame:
-    """
-    Parser unificado (streaming) — robusto a colagens em SSRS:
-      1) Pré-processamento e 'pulo do gato' (espaços entre dígitos≥10 ↔ Data, Hora ↔ Tipo,
-         ')' ↔ Matrícula, Matrícula ↔ Nome; normalização de escapes).
-      2) Segmentação por cabeçalho unificado (com/sem NrGuia explícito).
-      3) Âncora de fim: último valor monetário dentro/ao redor do segmento.
-      4) Extração: TipoGuia, Operadora, Matrícula(s), Beneficiário, Credenciado/Prestador.
-      5) Retorna DataFrame no schema TARGET_COLS.
-    """
-    import re
-    import pandas as pd
-
-    def _ws(s: str) -> str:
-        return re.sub(r"\s+", " ", (s or "").replace("\u00A0", " ")).strip()
-
-    def _drop_header_and_total(raw: str) -> str:
-        txt = _ws(raw)
-        m = re.search(r"(Atendimento\s*Nr\.?\s*Guia.*?Valor\s*Total)", txt, flags=re.I | re.S)
-        if m: txt = txt[m.end():]
-        txt = re.sub(r"total\s*r\$\s*\d{1,3}(?:\.\d{3})*,\d{2}", "", txt, flags=re.I)
-        return _ws(txt)
-
-    def _normalize_tipo_operadora(rest: str) -> str:
-        rest = re.sub(r'(?i)\b(Consulta)(?=[A-ZÁ-Ú])', r'\1 ', rest)
-        rest = re.sub(r'(?i)\b(SP/SADT)(?=[A-ZÁ-Ú])', r'\1 ', rest)
-        rest = re.sub(r'(?i)\b(Honorário(?:\s*Individual)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', rest)
-        rest = re.sub(r'(?i)\b(Não(?:\s*TISS)?(?:\s*-\s*Atendimento)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', rest)
-        rest = re.sub(r"(Consulta|SP/SADT)(?=[A-Z]{2,}\()", r"\1 ", rest)
-        return _ws(rest)
-
-    # Cabeçalho unificado: 1º número obrigatório, 2º opcional (NrGuia), depois Data e Hora
-    HDR_ANY = re.compile(r"(\d{6,})(?:\s+(\d{6,}))?\s*(\d{2}/\d{2}/\d{4})\s*(\d{2}:\d{2})")
-    VAL_RE  = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")
-    CODE_RE = re.compile(r"\d{3,6}-")
-
-    # ---------- 1) Pré-processamento ----------
-    if not texto or not str(texto).strip():
-        return pd.DataFrame(columns=TARGET_COLS)
-
-    s = (texto or "").replace("\u00A0", " ")
-    s = _ILLEGAL_CTRL_RE.sub("", s)
-
-    # Normaliza escapes do SSRS (\-, \(, \)) → caracteres literais
-    s = s.replace(r"\-", "-").replace(r"\(", "(").replace(r"\)", ")")  # NEW
-
-    # PULO DO GATO: colagens críticas
-    s = re.sub(r"(\d{10,})(\d{2}/\d{2}/\d{4})", r"\1 \2", s)     # Atendimento+NrGuia ↔ Data (colado)
-    s = re.sub(r"(\d{2}/\d{2}/\d{4})(\d{2}:\d{2})", r"\1 \2", s) # Data ↔ Hora (colado)
-    s = re.sub(r"(\d{2}:\d{2})([A-ZÁ-Ú])", r"\1 \2", s)         # Hora ↔ Tipo (colado)
-    s = re.sub(r"(\))(\d{5,})", r"\1 \2", s)                    # ')' ↔ Matrícula (colado)
-    s = re.sub(r"(\d{5,})([A-ZÁ-Ú])", r"\1 \2", s)              # NEW: Matrícula ↔ Nome (colado)
-
-    s = _drop_header_and_total(s)
-    if not s:
-        return pd.DataFrame(columns=TARGET_COLS)
-
-    # ---------- 2) Cabeçalhos (streaming) ----------
-    heads = list(HDR_ANY.finditer(s))
-    if not heads:
-        # Tenta forçar espaço entre número e data, caso extremo
-        s2 = re.sub(r"(\d{6,})(\s*)(\d{2}/\d{2}/\d{4})", r"\1 \3", s)
-        heads = list(HDR_ANY.finditer(s2))
-        s = s2
-    if not heads:
-        return pd.DataFrame(columns=TARGET_COLS)
-
-    # ---------- 3) Varredura por segmentos + âncora pelo Valor ----------
-    rows = []
-    for i, m in enumerate(heads):
-        start = m.start()
-        end   = heads[i+1].start() if (i + 1) < len(heads) else len(s)
-        segment = s[start:end]
-
-        vals = list(VAL_RE.finditer(segment))
-        if not vals:
-            segment_ext = s[start:min(len(s), end + 200)]
-            vals = list(VAL_RE.finditer(segment_ext))
-            if not vals:
-                continue
-            last_val  = vals[-1].group(0)
-            working   = segment_ext[:vals[-1].start()].strip()
-        else:
-            last_val  = vals[-1].group(0)
-            working   = segment[:vals[-1].start()].strip()
-
-        # ---------- 4) Cabeçalho ----------
-        a_num, guia_num, data, hora = m.groups()
-        if guia_num and guia_num.strip():
-            atendimento = a_num
-            nr_guia     = guia_num
-        else:
-            if len(a_num) > 8:
-                atendimento = a_num[:-8]
-                nr_guia     = a_num[-8:]
-            else:
-                atendimento = a_num
-                nr_guia     = ""
-
-        # "resto" = trecho após a HORA
-        hpos = working.find(hora)
-        if hpos == -1:
-            continue
-        rest = working[hpos + len(hora):].strip()
-
-        rest = _normalize_tipo_operadora(rest)
-
-        # ---------- 5) Credenciado / Prestador ----------
-        codes = list(CODE_RE.finditer(rest))
-        if len(codes) >= 2:
-            i1, i2 = codes[-2].start(), codes[-1].start()
-            prest  = rest[i2:].strip()
-            cred   = rest[i1:i2].strip()
-            core   = rest[:i1].strip()
-        elif len(codes) == 1:
-            i2     = codes[-1].start()
-            prest  = rest[i2:].strip()
-            cred   = ""
-            core   = rest[:i2].strip()
-        else:
-            prest  = ""
-            cred   = ""
-            core   = rest
-
-        # ---------- 6) Tipo + Operadora + Matrícula + Beneficiário ----------
-        toks = core.split()
-        tipo, tail, _ = split_tipo_operadora(toks)
-
-        idx_mat = None
-        for j, t in enumerate(tail):
-            if is_mat_token(t):
-                idx_mat = j
-                break
-
-        if idx_mat is None:
-            operadora    = " ".join(tail).strip()
-            matricula    = ""
-            beneficiario = ""
-        else:
-            operadora = " ".join(tail[:idx_mat]).strip()
-            k = idx_mat
-            mats = []
-            while k < len(tail) and is_mat_token(tail[k]):
-                mats.append(tail[k]); k += 1
-            matricula    = " ".join(mats).strip()
-            beneficiario = " ".join(tail[k:]).strip()
-
-        rows.append({
-            "Atendimento":  atendimento,
-            "NrGuia":       nr_guia,
-            "Realizacao":   data,
-            "Hora":         hora,
-            "TipoGuia":     tipo,
-            "Operadora":    operadora,
-            "Matricula":    matricula,
-            "Beneficiario": beneficiario,
-            "Credenciado":  cred,
-            "Prestador":    prest,
-            "ValorTotal":   last_val,
-        })
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return pd.DataFrame(columns=TARGET_COLS)
-
-    try:
-        df["Realizacao_dt"] = pd.to_datetime(df["Realizacao"], format="%d/%m/%Y", errors="coerce")
-        df = df.sort_values(["Realizacao_dt", "Hora"]).drop(columns=["Realizacao_dt"])
-    except Exception:
-        pass
-
-    return ensure_atendimentos_schema(sanitize_df(df))
-
-# ========= Selenium =========
-def configurar_driver():
-    opts = Options()
-    chrome_binary  = os.environ.get("CHROME_BINARY", "/usr/bin/chromium")
-    driver_binary  = os.environ.get("CHROMEDRIVER_BINARY", "/usr/bin/chromedriver")
-    if os.path.exists(chrome_binary):
-        opts.binary_location = chrome_binary
-
-    opts.add_argument("--headless")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1920,1080")
-
-    prefs = {
-        "download.default_directory": DOWNLOAD_TEMPORARIO,
-        "download.prompt_for_download": False,
-        "safebrowsing.enabled": True,
-        "profile.default_content_setting_values.automatic_downloads": 1,
-    }
-    opts.add_experimental_option("prefs", prefs)
-
-    if os.path.exists(driver_binary):
-        service = Service(executable_path=driver_binary)
-        driver = webdriver.Chrome(service=service, options=opts)
-    else:
-        driver = webdriver.Chrome(options=opts)
-
-    driver.set_page_load_timeout(60)
-    return driver
-
-def wait_visible(driver, locator, timeout=30):
-    return WebDriverWait(driver, timeout).until(EC.visibility_of_element_located(locator))
-
-def safe_click(driver, locator, timeout=30):
-    try:
-        el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable(locator))
-        el.click()
-        return el
-    except (ElementClickInterceptedException, TimeoutException, WebDriverException):
-        el = WebDriverWait(driver, timeout).until(EC.presence_of_element_located(locator))
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        driver.execute_script("arguments[0].click();", el)
-        return el
-
-# ========= Captura robusta de TEXTO no ReportViewer =========
-def capture_report_text(driver):
-    """
-    Tenta extrair texto do ReportViewer em diferentes renderizações SSRS.
-    Retorna (texto, origem) para debug.
-    """
-    # 1) Container padrão do SSRS moderno
-    try:
-        el = driver.find_element(By.ID, "VisibleReportContent")
-        txt = el.text.strip()
-        if len(txt) > 50:
-            return txt, "#VisibleReportContent.text"
-        # textContent via JS (pega textos invisíveis por CSS)
-        txt2 = driver.execute_script("return arguments[0].textContent;", el) or ""
-        txt2 = txt2.strip()
-        if len(txt2) > 50:
-            return txt2, "#VisibleReportContent.textContent"
-    except Exception:
-        pass
-
-    # 2) Containers típicos
-    for sel in [".doc", ".FixedTable", ".FixedDocument", "div[aria-label='Relatório']"]:
-        try:
-            el = driver.find_element(By.CSS_SELECTOR, sel)
-            txt = el.text.strip()
-            if len(txt) > 50:
-                return txt, f"{sel}.text"
-            txt2 = driver.execute_script("return arguments[0].textContent;", el) or ""
-            txt2 = txt2.strip()
-            if len(txt2) > 50:
-                return txt2, f"{sel}.textContent"
-        except Exception:
-            continue
-
-    # 3) Concatena todas as células em containers conhecidos
-    try:
-        cells = driver.find_elements(By.CSS_SELECTOR, ".FixedTable *")
-        if not cells:
-            cells = driver.find_elements(By.CSS_SELECTOR, ".doc *")
-        parts = []
-        for c in cells:
-            t = (c.text or "").strip()
-            if t:
-                parts.append(t)
-        if parts:
-            txt = " ".join(parts)
-            if len(txt) > 50:
-                return txt, "FixedTable/doc cells join"
-    except Exception:
-        pass
-
-    # 4) Fallbacks do body
-    try:
-        txt = driver.execute_script("return document.body.innerText;") or ""
-        txt = txt.strip()
-        if len(txt) > 50:
-            return txt, "document.body.innerText"
-    except Exception:
-        pass
-
-    try:
-        txt2 = driver.execute_script("return document.body.textContent;") or ""
-        txt2 = txt2.strip()
-        if len(txt2) > 50:
-            return txt2, "document.body.textContent"
-    except Exception:
-        pass
-
-    return "", "no-text (image/canvas rendering)"
-
-# ========= PDF → Tabela (coordenadas + textual reforçado) =========
+# -- (b) Parser PDF (mantido, sem alterações) --
 def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool = False) -> pd.DataFrame:
-    """
-    mode: "coord" (coordenadas) | "text" (fallback textual reforçado)
-    Sempre aplica ensure_atendimentos_schema() antes de retornar.
-    """
     import pdfplumber
     from PyPDF2 import PdfReader
 
-    # Tolerâncias (apenas para 'coord')
     TOP_TOL      = 4.5
     MERGE_GAP_X  = 10.0
     COL_MARGIN   = 4.0
 
-    # Regex comuns (locais ao parser PDF)
     val_re_local        = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")
     val_line_re         = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}$")
     code_start_re_local = re.compile(r"\d{3,6}-")
@@ -712,163 +305,6 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
     def _normalize_ws_local(s: str) -> str:
         return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip()
 
-    # ---------- Coordenadas ----------
-    def parse_by_coords() -> pd.DataFrame:
-        all_records = []
-        try:
-            with pdfplumber.open(pdf_path) as pdf:
-                for page_i, page in enumerate(pdf.pages, start=1):
-                    words = page.extract_words(
-                        use_text_flow=True,
-                        extra_attrs=["x0","x1","top","bottom"]
-                    )
-                    if not words:
-                        continue
-
-                    # Cabeçalho: localizar banda com "Atendimento" e "Valor Total"
-                    header_y = None
-                    header_words = []
-                    for w in words:
-                        if "Atendimento" in w["text"]:
-                            y_top = w["top"]
-                            band = [ww for ww in words if abs(ww["top"] - y_top) <= TOP_TOL]
-                            band_text = " ".join([b["text"] for b in band])
-                            if ("Valor" in band_text) and ("Total" in band_text):
-                                header_y = y_top
-                                header_words = sorted(band, key=lambda z: z["x0"])
-                                break
-
-                    # Fallback extract_tables
-                    if header_y is None or not header_words:
-                        tbls = page.extract_tables()
-                        if tbls:
-                            df = pd.DataFrame(tbls[0])
-                            if not df.empty:
-                                df.columns = df.iloc[0]
-                                df = df.iloc[1:].dropna(how="all", axis=1)
-                                df = ensure_atendimentos_schema(df)
-                                for _, r in df.iterrows():
-                                    all_records.append({k: str(r.get(k, "")).strip() for k in TARGET_COLS})
-                        continue
-
-                    # Blocos do cabeçalho
-                    blocks, cur = [], [header_words[0]]
-                    for w in header_words[1:]:
-                        if (w["x0"] - cur[-1]["x1"]) <= MERGE_GAP_X:
-                            cur.append(w)
-                        else:
-                            blocks.append(cur); cur = [w]
-                    blocks.append(cur)
-
-                    header_blocks = [{
-                        "text": " ".join([b["text"] for b in bl]),
-                        "x0": min([b["x0"] for b in bl]),
-                        "x1": max([b["x1"] for b in bl]),
-                    } for bl in blocks]
-
-                    def map_block(txt: str):
-                        t = txt.lower()
-                        if "atendimento" in t:                   return "Atendimento"
-                        if "nr" in t and "guia" in t:            return "NrGuia"
-                        if "realiza" in t:                       return "Realizacao"
-                        if "hora" in t:                          return "Hora"
-                        if "tipo" in t and "guia" in t:          return "TipoGuia"
-                        if "operadora" in t:                     return "Operadora"
-                        if "matr" in t:                          return "Matricula"
-                        if "benef" in t:                         return "Beneficiario"
-                        if "credenciado" in t:                   return "Credenciado"
-                        if "prestador" in t:                     return "Prestador"
-                        if "valor" in t and "total" in t:        return "ValorTotal"
-                        return None
-
-                    columns = []
-                    for hb in header_blocks:
-                        name = map_block(hb["text"])
-                        if name:
-                            columns.append({"name": name, "x0": hb["x0"], "x1": hb["x1"]})
-                    columns = sorted(columns, key=lambda c: c["x0"])
-                    if not columns:
-                        continue
-
-                    # Palavras de dados; corta "Total"
-                    data_words = [w for w in words if w["top"] > header_y + TOP_TOL]
-                    total_candidates = [w for w in data_words if w["text"].lower() == "total"]
-                    if total_candidates:
-                        total_y = total_candidates[0]["top"]
-                        data_words = [w for w in data_words if w["top"] < total_y - TOP_TOL]
-
-                    # Bandas (linhas)
-                    rows_band, band, last_top = [], [], None
-                    for w in sorted(data_words, key=lambda z: (round(z["top"], 1), z["x0"])):
-                        if (last_top is None) or (abs(w["top"] - last_top) <= TOP_TOL):
-                            band.append(w); last_top = w["top"]
-                        else:
-                            rows_band.append(band); band = [w]; last_top = w["top"]
-                    if band: rows_band.append(band)
-
-                    # Atribuição por centro/interseção
-                    col_centers = [(c["name"], (c["x0"] + c["x1"]) / 2.0) for c in columns]
-                    def assign_to_nearest_col(w):
-                        wc = (w["x0"] + w["x1"]) / 2.0
-                        name, dist = None, 1e9
-                        for cname, cc in col_centers:
-                            d = abs(wc - cc)
-                            if d < dist: name, dist = cname, d
-                        return name
-
-                    for row_words in rows_band:
-                        bucket = {c["name"]: [] for c in columns}
-                        for w in row_words:
-                            cname = assign_to_nearest_col(w)
-                            if cname is None:
-                                for c in columns:
-                                    intersects = not (w["x1"] < (c["x0"] - COL_MARGIN) or w["x0"] > (c["x1"] + COL_MARGIN))
-                                    if intersects:
-                                        cname = c["name"]; break
-                            if cname is None:
-                                continue
-                            bucket[cname].append(w)
-
-                        cols_text = {k: " ".join([ww["text"] for ww in sorted(v, key=lambda z: z["x0"])]) for k, v in bucket.items()}
-                        if not cols_text.get("ValorTotal") or not val_line_re.search(cols_text["ValorTotal"]):
-                            continue
-
-                        # Ajuste Credenciado/Prestador
-                        tail = _normalize_ws_local(" ".join([cols_text.get("Beneficiario",""), cols_text.get("Credenciado",""), cols_text.get("Prestador","")]))
-                        starts = [m.start() for m in code_start_re_local.finditer(tail)]
-                        cred = cols_text.get("Credenciado","").strip()
-                        prest = cols_text.get("Prestador","").strip()
-                        if (not cred or not prest) and len(starts) >= 2:
-                            i1, i2 = starts[-2], starts[-1]
-                            prest = tail[i2:].strip()
-                            cred  = tail[i1:i2].strip()
-
-                        all_records.append({
-                            "Atendimento":   cols_text.get("Atendimento","").strip(),
-                            "NrGuia":        cols_text.get("NrGuia","").strip(),
-                            "Realizacao":    cols_text.get("Realizacao","").strip(),
-                            "Hora":          cols_text.get("Hora","").strip(),
-                            "TipoGuia":      cols_text.get("TipoGuia","").strip(),
-                            "Operadora":     cols_text.get("Operadora","").strip(),
-                            "Matricula":     cols_text.get("Matricula","").strip(),
-                            "Beneficiario":  cols_text.get("Beneficiario","").strip(),
-                            "Credenciado":   cred,
-                            "Prestador":     prest,
-                            "ValorTotal":    cols_text.get("ValorTotal","").strip(),
-                        })
-        except Exception as e:
-            if debug: st.error(f"[coord] Falha: {e}")
-
-        out = pd.DataFrame(all_records)
-        if not out.empty:
-            try:
-                out["Realizacao_dt"] = pd.to_datetime(out["Realizacao"], format="%d/%m/%Y", errors="coerce")
-                out = out.sort_values(["Realizacao_dt","Hora"]).drop(columns=["Realizacao_dt"])
-            except Exception:
-                pass
-        return ensure_atendimentos_schema(out)
-
-    # ---------- Texto (fallback textual reforçado) ----------
     def parse_by_text() -> pd.DataFrame:
         try:
             reader = PdfReader(open(pdf_path, "rb"))
@@ -923,7 +359,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                     continue
                 atendimento, nr_guia, realizacao, hora, rest = m_head.groups()
 
-                # Patches de colagem
+                # patches
                 rest = re.sub(r'(?i)\b(Consulta)(?=[A-ZÁ-Ú])', r'\1 ', rest)
                 rest = re.sub(r'(?i)\b(SP/SADT)(?=[A-ZÁ-Ú])', r'\1 ', rest)
                 rest = re.sub(r'(?i)\b(Honorário(?:\s*Individual)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', rest)
@@ -985,15 +421,301 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                 st.error(f"[text] Falha: {e}")
             return pd.DataFrame(columns=TARGET_COLS)
 
-    # Seleção de modo
-    if mode == "text":
-        return sanitize_df(parse_by_text())
+    # para manter curto: usamos o modo textual
+    return parse_by_text()
 
-    out = parse_by_coords()
-    if out.empty:
-        if debug: st.warning("Nenhuma linha por coordenadas — aplicando fallback textual.")
-        out = parse_by_text()
-    return sanitize_df(out)
+# ========= NOVO: Parser Streaming — ÂNCORAS EXPLÍCITAS (versão de validação, NÃO v2) =========
+def normalize_collages(s: str) -> str:
+    """Normaliza 'colagens' do ReportViewer e escapes literais."""
+    if not s: return ""
+    s = s.replace("\u00A0", " ")
+    s = _ILLEGAL_CTRL_RE.sub("", s)
+
+    # Escapes do ReportViewer -> literais
+    s = s.replace(r"\-", "-").replace(r"\(", "(").replace(r"\)", ")")
+
+    # Espaços estratégicos
+    s = re.sub(r"(\d{10,})(\d{2}/\d{2}/\d{4})", r"\1 \2", s)         # Atendimento+NrGuia ↔ Data
+    s = re.sub(r"(\d{2}/\d{2}/\d{4})(\d{2}:\d{2})", r"\1 \2", s)     # Data ↔ Hora
+    s = re.sub(r"(\d{2}:\d{2})(?=[A-Za-zÁ-Úá-úNÇS/])", r"\1 ", s)    # Hora ↔ Tipo
+    s = re.sub(r"(\d{4})(\d{2}:\d{2})", r"\1 \2", s)                 # Ano ↔ Hora (fallback)
+
+    # Tipo ↔ Operadora
+    s = re.sub(r'(?i)\b(Consulta)(?=[A-ZÁ-Ú])', r'\1 ', s)
+    s = re.sub(r'(?i)\b(SP/SADT)(?=[A-ZÁ-Ú])', r'\1 ', s)
+    s = re.sub(r'(?i)\b(Honorário(?:\s*Individual)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', s)
+    s = re.sub(r'(?i)\b(Não(?:\s*TISS)?(?:\s*-\s*Atendimento)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', s)
+    s = re.sub(r"(Consulta|SP/SADT)(?=[A-Z]{2,}\()", r"\1 ", s)
+
+    # ')' ↔ Matrícula + Matrícula ↔ Nome
+    s = re.sub(r"(\))(\d{5,})", r"\1 \2", s)
+    s = re.sub(r"(\d{5,})([A-ZÁ-Ú])", r"\1 \2", s)
+
+    return re.sub(r"\s+", " ", s).strip()
+
+def parse_streaming_with_anchors(texto: str) -> pd.DataFrame:
+    """
+    Parser por ÂNCORAS (versão de validação — NÃO v2):
+      1) Normaliza colagens (sem alterações de semântica).
+      2) Segmenta por cabeçalho: número(s) + data + hora.
+      3) Âncora de fim: último valor dentro do segmento; se não existir, descarta o segmento.
+      4) Âncora central (parênteses com código) por TOKENS: procura o 1º token que contenha '(\\d+)'.
+      5) À esquerda do token '(\\d+)': Tipo + nome da Operadora; à direita: Matrícula, Beneficiário, Códigos.
+    """
+    if not texto or not str(texto).strip():
+        return pd.DataFrame(columns=TARGET_COLS)
+
+    s = normalize_collages(texto)
+
+    # Drop preâmbulo e 'Total R$ ...'
+    m = re.search(r"(Atendimento\s*Nr\.?\s*Guia.*?Valor\s*Total)", s, flags=re.I|re.S)
+    if m: s = s[m.end():]
+    s = re.sub(r"total\s*r\$\s*\d{1,3}(?:\.\d{3})*,\d{2}", "", s, flags=re.I)
+
+    heads = list(HDR_ANY.finditer(s))
+    if not heads:
+        return pd.DataFrame(columns=TARGET_COLS)
+
+    rows = []
+    for i, mh in enumerate(heads):
+        start = mh.start()
+        end   = heads[i+1].start() if (i + 1) < len(heads) else len(s)
+        segment = s[start:end]
+
+        # Âncora de fim: último valor (dentro do segmento); se não achar, descarta
+        vals = list(val_re.finditer(segment))
+        if not vals:
+            # (NÃO usar janela estendida nesta versão)
+            continue
+        last_val  = vals[-1].group(0)
+        working   = segment[:vals[-1].start()].strip()
+
+        # Cabeçalho
+        a_num, guia_num, data, hora = mh.groups()
+        if guia_num and guia_num.strip():
+            atendimento = a_num; nr_guia = guia_num
+        else:
+            atendimento = a_num[:-8] if len(a_num) > 8 else a_num
+            nr_guia     = a_num[-8:] if len(a_num) > 8 else ""
+
+        # Resto após Hora
+        hpos = working.find(hora)
+        if hpos == -1:
+            continue
+        rest = working[hpos + len(hora):].strip()
+
+        # Normalizações leves (Tipo ↔ Operadora)
+        rest = re.sub(r'(?i)\b(Consulta)(?=[A-ZÁ-Ú])', r'\1 ', rest)
+        rest = re.sub(r'(?i)\b(SP/SADT)(?=[A-ZÁ-Ú])', r'\1 ', rest)
+        rest = re.sub(r'(?i)\b(Honorário(?:\s*Individual)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', rest)
+        rest = re.sub(r'(?i)\b(Não(?:\s*TISS)?(?:\s*-\s*Atendimento)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', rest)
+        rest = re.sub(r"(Consulta|SP/SADT)(?=[A-Z]{2,}\()", r"\1 ", rest)
+
+        # ---- ÂNCORA CENTRAL por TOKENS ----
+        toks = rest.split()
+        if not toks:
+            continue
+        tipo = toks[0]
+        token_idx_code = None
+        for j in range(1, len(toks)):
+            if re.search(r"\(\d{2,}\)", toks[j]):  # ex.: "AFFEGO(056)", "SAÚDE(433)", "(216)"
+                token_idx_code = j
+                break
+
+        if token_idx_code is None:
+            # Fallback mínimo: tenta heurística antiga
+            tail = toks[1:]
+            idx_mat = None
+            for j, t in enumerate(tail):
+                if is_mat_token(t):
+                    idx_mat = j; break
+            if idx_mat is None:
+                operadora    = " ".join(tail).strip()
+                matricula    = ""
+                beneficiario = ""
+            else:
+                operadora = " ".join(tail[:idx_mat]).strip()
+                k = idx_mat
+                mats = []
+                while k < len(tail) and is_mat_token(tail[k]):
+                    mats.append(tail[k]); k += 1
+                matricula    = " ".join(mats).strip()
+                beneficiario = " ".join(tail[k:]).strip()
+        else:
+            # Operadora = tudo de toks[1 : token_idx_code+1] (inclui token com '(ddd)')
+            operadora_tokens = toks[1:token_idx_code+1]
+            operadora = " ".join(operadora_tokens).strip()
+            right_tail = toks[token_idx_code+1:]
+
+            # Matrícula = 1º alfanum longo; Beneficiário = até códigos
+            matricula = ""
+            if right_tail:
+                # 1º token longo
+                pos_mat = None
+                for k, t in enumerate(right_tail):
+                    if re.fullmatch(r"[0-9A-Z]{5,}", t):
+                        pos_mat = k; break
+                if pos_mat is not None:
+                    matricula = right_tail[pos_mat]
+                    after_mat = right_tail[pos_mat+1:]
+                else:
+                    after_mat = right_tail[:]
+            else:
+                after_mat = []
+
+            ben_str = " ".join(after_mat).strip()
+
+            # Credenciado/Prestador via códigos no final
+            codes = list(code_start_re.finditer(ben_str))
+            if len(codes) >= 2:
+                i1, i2 = codes[-2].start(), codes[-1].start()
+                prest = ben_str[i2:].strip()
+                cred  = ben_str[i1:i2].strip()
+                beneficiario = ben_str[:i1].strip()
+            elif len(codes) == 1:
+                i2 = codes[-1].start()
+                prest = ben_str[i2:].strip()
+                cred  = ""
+                beneficiario = ben_str[:i2].strip()
+            else:
+                cred = prest = ""
+                beneficiario = ben_str
+
+        rows.append({
+            "Atendimento":  atendimento,
+            "NrGuia":       nr_guia,
+            "Realizacao":   data,
+            "Hora":         hora,
+            "TipoGuia":     tipo,
+            "Operadora":    operadora,
+            "Matricula":    matricula,
+            "Beneficiario": beneficiario,
+            "Credenciado":  cred,
+            "Prestador":    prest,
+            "ValorTotal":   last_val,
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=TARGET_COLS)
+
+    try:
+        df["Realizacao_dt"] = pd.to_datetime(df["Realizacao"], format="%d/%m/%Y", errors="coerce")
+        df = df.sort_values(["Realizacao_dt","Hora"]).drop(columns=["Realizacao_dt"])
+    except Exception:
+        pass
+
+    return ensure_atendimentos_schema(sanitize_df(df))
+
+# ========= Selenium / Automação =========
+def configurar_driver():
+    opts = Options()
+    chrome_binary  = os.environ.get("CHROME_BINARY", "/usr/bin/chromium")
+    driver_binary  = os.environ.get("CHROMEDRIVER_BINARY", "/usr/bin/chromedriver")
+    if os.path.exists(chrome_binary):
+        opts.binary_location = chrome_binary
+
+    opts.add_argument("--headless")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1920,1080")
+
+    prefs = {
+        "download.default_directory": DOWNLOAD_TEMPORARIO,
+        "download.prompt_for_download": False,
+        "safebrowsing.enabled": True,
+        "profile.default_content_setting_values.automatic_downloads": 1,
+    }
+    opts.add_experimental_option("prefs", prefs)
+
+    if os.path.exists(driver_binary):
+        service = Service(executable_path=driver_binary)
+        driver = webdriver.Chrome(service=service, options=opts)
+    else:
+        driver = webdriver.Chrome(options=opts)
+
+    driver.set_page_load_timeout(60)
+    return driver
+
+def wait_visible(driver, locator, timeout=30):
+    return WebDriverWait(driver, timeout).until(EC.visibility_of_element_located(locator))
+
+def safe_click(driver, locator, timeout=30):
+    try:
+        el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable(locator))
+        el.click()
+        return el
+    except (ElementClickInterceptedException, TimeoutException, WebDriverException):
+        el = WebDriverWait(driver, timeout).until(EC.presence_of_element_located(locator))
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        driver.execute_script("arguments[0].click();", el)
+        return el
+
+def capture_report_text(driver):
+    try:
+        el = driver.find_element(By.ID, "VisibleReportContent")
+        txt = el.text.strip()
+        if len(txt) > 50:
+            return txt, "#VisibleReportContent.text"
+        txt2 = driver.execute_script("return arguments[0].textContent;", el) or ""
+        txt2 = txt2.strip()
+        if len(txt2) > 50:
+            return txt2, "#VisibleReportContent.textContent"
+    except Exception:
+        pass
+
+    for sel in [".doc", ".FixedTable", ".FixedDocument", "div[aria-label='Relatório']"]:
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, sel)
+            txt = el.text.strip()
+            if len(txt) > 50:
+                return txt, f"{sel}.text"
+            txt2 = driver.execute_script("return arguments[0].textContent;", el) or ""
+            txt2 = txt2.strip()
+            if len(txt2) > 50:
+                return txt2, f"{sel}.textContent"
+        except Exception:
+            continue
+
+    try:
+        cells = driver.find_elements(By.CSS_SELECTOR, ".FixedTable *")
+        if not cells:
+            cells = driver.find_elements(By.CSS_SELECTOR, ".doc *")
+        parts = []
+        for c in cells:
+            t = (c.text or "").strip()
+            if t:
+                parts.append(t)
+        if parts:
+            txt = " ".join(parts)
+            if len(txt) > 50:
+                return txt, "FixedTable/doc cells join"
+    except Exception:
+        pass
+
+    try:
+        txt = driver.execute_script("return document.body.innerText;") or ""
+        txt = txt.strip()
+        if len(txt) > 50:
+            return txt, "document.body.innerText"
+    except Exception:
+        pass
+
+    try:
+        txt2 = driver.execute_script("return document.body.textContent;") or ""
+        txt2 = txt2.strip()
+        if len(txt2) > 50:
+            return txt2, "document.body.textContent"
+    except Exception:
+        pass
+
+    return "", "no-text (image/canvas rendering)"
+
+def to_float_br(s):
+    try:
+        return float(str(s).replace('.', '').replace(',', '.'))
+    except Exception:
+        return 0.0
 
 # ========= UI =========
 with st.sidebar:
@@ -1016,9 +738,9 @@ with st.sidebar:
     debug_parser       = st.checkbox("🧪 Debug do parser PDF", value=False)
     debug_heads        = st.checkbox("🧩 Mostrar contagem de cabeçalhos detectados (modo TEXTO)", value=True)
 
-    # 🔘 Toggle — Forçar parser streaming unificado
+    # 🔘 Toggle — Forçar parser streaming unificado (agora chama Âncoras Explícitas)
     force_streaming    = st.toggle("⚙️ Forçar parser streaming (texto colado/sem espaços)", value=True)
-    st.caption("Ligado: usa o parser unificado `parse_streaming_any(texto)`.\nDesligado: usa o parser atual `parse_relatorio_text_to_atendimentos_df(texto)`.")
+    st.caption("Ligado: usa o parser por âncoras explícitas. Desligado: usa o parser legado.")
 
 # ========= (Opcional) Processar TEXTO manualmente =========
 with st.expander("🧪 Colar TEXTO do relatório (sem automação)", expanded=False):
@@ -1029,7 +751,7 @@ with st.expander("🧪 Colar TEXTO do relatório (sem automação)", expanded=Fa
         else:
             # Usa o toggle para decidir o parser
             if force_streaming:
-                df_txt = parse_streaming_any(texto_manual)
+                df_txt = parse_streaming_with_anchors(texto_manual)  # <<<<<<<<
             else:
                 df_txt = parse_relatorio_text_to_atendimentos_df(texto_manual, debug_heads=debug_heads)
 
@@ -1152,9 +874,9 @@ if st.button("🚀 Iniciar Processo"):
                         continue
 
                     st.write("📄 Processando TEXTO do relatório...")
-                    # Usa o toggle para decidir o parser
+                    # Usa o toggle para decidir o parser (ÂNCORAS EXPLÍCITAS)
                     if force_streaming:
-                        df_txt = parse_streaming_any(texto_relatorio)
+                        df_txt = parse_streaming_with_anchors(texto_relatorio)   # <<<<<<<<
                     else:
                         df_txt = parse_relatorio_text_to_atendimentos_df(texto_relatorio, debug_heads=debug_heads)
 
@@ -1170,8 +892,7 @@ if st.button("🚀 Iniciar Processo"):
                         st.info(f"📑 Total do lote (TEXTO): **{total_br}** — {len(df_txt)} linha(s)")
 
                         # Preview
-                        cols_show = TARGET_COLS
-                        st.dataframe(df_txt[cols_show], use_container_width=True)
+                        st.dataframe(df_txt[TARGET_COLS], use_container_width=True)
 
                         # Consolida
                         st.session_state.db_consolidado = pd.concat([st.session_state.db_consolidado, df_txt], ignore_index=True)
@@ -1187,7 +908,7 @@ if st.button("🚀 Iniciar Processo"):
                 else:
                     # ====== Fluxo legado: Exportar PDF ======
                     dropdown = wait.until(EC.presence_of_element_located((By.ID, "ReportView_ReportToolbar_ExportGr_FormatList_DropDownList")))
-                    Select(dropdown).select_by_value("PDF")  # Se quiser CSV: "CSV"
+                    Select(dropdown).select_by_value("PDF")
                     time.sleep(2)
                     export_btn = driver.find_element(By.ID, "ReportView_ReportToolbar_ExportGr_Export")
                     driver.execute_script("arguments[0].click();", export_btn)
