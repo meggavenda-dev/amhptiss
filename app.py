@@ -36,7 +36,6 @@ def processar_pdf_amhp(caminho_pdf, status_nome, neg_nome):
         if not dados_lista: return False
         
         df_final = pd.concat(dados_lista, ignore_index=True)
-        # Limpeza de caracteres invisíveis e quebras de linha
         df_final.columns = [str(c).replace('\n', ' ').strip() for c in df_final.columns]
         df_final = df_final.applymap(lambda x: re.sub(r'[^\x20-\x7E\xA0-\xFF]', '', str(x)) if pd.notnull(x) else x)
         
@@ -60,7 +59,7 @@ def iniciar_driver():
     prefs = {
         "download.default_directory": DOWNLOAD_TEMPORARIO,
         "download.prompt_for_download": False,
-        "plugins.always_open_pdf_externally": True # Essencial para PDF
+        "plugins.always_open_pdf_externally": True 
     }
     options.add_experimental_option("prefs", prefs)
     return webdriver.Chrome(options=options)
@@ -75,7 +74,7 @@ with col2: data_fim = st.text_input("📅 Data Final", value="13/01/2026")
 if st.button("🚀 Iniciar Processo PDF"):
     preparar_ambiente()
     driver = iniciar_driver()
-    wait = WebDriverWait(driver, 35)
+    wait = WebDriverWait(driver, 45) # Aumentado para maior estabilidade
     
     try:
         with st.status("Realizando login e captura...", expanded=True) as status:
@@ -91,30 +90,26 @@ if st.button("🚀 Iniciar Processo PDF"):
             btn_tiss = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'AMHPTISS')]")))
             driver.execute_script("arguments[0].click();", btn_tiss)
             
-            time.sleep(10)
-            if len(driver.window_handles) > 1:
-                driver.switch_to.window(driver.window_handles[-1])
+            wait.until(lambda d: len(d.window_handles) > 1) # Espera a aba abrir
+            driver.switch_to.window(driver.window_handles[-1])
 
             # 3. LIMPEZA DE BLOQUEIOS
-            driver.execute_script("""
-                document.querySelectorAll('center, .loading, .overlay, #fechar-informativo').forEach(el => el.remove());
-            """)
+            time.sleep(5)
+            driver.execute_script("document.querySelectorAll('center, .loading, .overlay, #fechar-informativo').forEach(el => el.remove());")
 
             # 4. NAVEGAÇÃO
-            ir_para = wait.until(EC.element_to_be_clickable((By.ID, "IrPara"))) # CORREÇÃO 1: element_to_be_clickable
+            ir_para = wait.until(EC.element_to_be_clickable((By.ID, "IrPara")))
             driver.execute_script("arguments[0].click();", ir_para)
-            time.sleep(2)
-
-            cons = wait.until(EC.element_to_be_clickable((By.XPATH, "//span[contains(text(), 'Consultório')]"))) # CORREÇÃO 1
+            
+            cons = wait.until(EC.element_to_be_clickable((By.XPATH, "//span[contains(text(), 'Consultório')]")))
             driver.execute_script("arguments[0].click();", cons)
             
-            atend = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[@href='AtendimentosRealizados.aspx']"))) # CORREÇÃO 1
+            atend = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[@href='AtendimentosRealizados.aspx']")))
             driver.execute_script("arguments[0].click();", atend)
-            time.sleep(5)
-
+            
             # 5. FILTROS
             st.write("📝 Aplicando filtros...")
-            driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataInicio_dateInput").send_keys(data_ini + Keys.TAB)
+            wait.until(EC.presence_of_element_located((By.ID, "ctl00_MainContent_rdpDigitacaoDataInicio_dateInput"))).send_keys(data_ini + Keys.TAB)
             driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataFim_dateInput").send_keys(data_fim + Keys.TAB)
             
             btn_buscar = driver.find_element(By.ID, "ctl00_MainContent_btnBuscar_input")
@@ -122,34 +117,31 @@ if st.button("🚀 Iniciar Processo PDF"):
             
             # 6. EXPORTAR PDF
             wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".rgMasterTable")))
-            time.sleep(2) # Pausa para renderização estável da tabela
+            time.sleep(3)
             driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "ctl00_MainContent_rdgAtendimentosRealizados_ctl00_ctl02_ctl00_SelectColumnSelectCheckBox"))
-            time.sleep(4)
-            
+            time.sleep(2)
             driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "ctl00_MainContent_rbtImprimirAtendimentos_input"))
-            time.sleep(15)
-
-            # CORREÇÃO 2: Espera segura pelo Iframe antes de trocar
+            
+            # --- CORREÇÃO DO STACKTRACE AQUI ---
+            # Espera o iframe estar pronto e troca de contexto automaticamente
             wait.until(EC.frame_to_be_available_and_switch_to_it((By.TAG_NAME, "iframe")))
 
             # Seleciona PDF
-            dropdown = wait.until(EC.presence_of_element_located((By.ID, "ReportView_ReportToolbar_ExportGr_FormatList_DropDownList")))
+            dropdown = wait.until(EC.element_to_be_clickable((By.ID, "ReportView_ReportToolbar_ExportGr_FormatList_DropDownList")))
             Select(dropdown).select_by_value("PDF")
             time.sleep(2)
             
-            # CORREÇÃO 3: Garantir que o botão de exportação é clicável no Iframe
             btn_export = wait.until(EC.element_to_be_clickable((By.ID, "ReportView_ReportToolbar_ExportGr_Export")))
             driver.execute_script("arguments[0].click();", btn_export)
             
             st.write("📥 Baixando e processando...")
             time.sleep(25)
 
-            # 7. PROCESSAMENTO E BANCO TEMPORÁRIO
+            # 7. PROCESSAMENTO
             arquivos = [os.path.join(DOWNLOAD_TEMPORARIO, f) for f in os.listdir(DOWNLOAD_TEMPORARIO) if f.endswith('.pdf')]
             if arquivos:
                 recente = max(arquivos, key=os.path.getctime)
-                if processar_pdf_amhp(recente, "300", "Direto"):
-                    st.success("✅ Dados extraídos do PDF e salvos no banco temporário!")
+                processar_pdf_amhp(recente, "300", "Direto")
                 os.remove(recente)
             else:
                 st.error("Arquivo PDF não encontrado.")
