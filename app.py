@@ -7,88 +7,104 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import time
 
-st.set_page_config(page_title="Automação AMHP", page_icon="🏥")
+# --- CONFIGURAÇÃO DA INTERFACE ---
+st.set_page_config(page_title="Automação AMHPTISS", page_icon="🏥", layout="wide")
 
 def iniciar_driver():
     options = Options()
     options.add_argument("--headless")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    # Ignora erros de certificado e logs desnecessários
     options.add_argument("--ignore-certificate-errors")
-    options.add_argument("--log-level=3")
     
-    service = Service("/usr/bin/chromedriver")
+    # Caminho do driver no Streamlit Cloud (via packages.txt)
     try:
+        service = Service("/usr/bin/chromedriver")
         return webdriver.Chrome(service=service, options=options)
     except:
+        # Fallback para execução local
         return webdriver.Chrome(options=options)
 
-st.title("🚀 Automação AMHP")
+# --- TÍTULO E VERIFICAÇÃO ---
+st.title("🏥 Automação de Relatórios AMHP")
+st.markdown("---")
 
 if "credentials" not in st.secrets:
-    st.error("Configure os Secrets!")
+    st.error("❌ Erro: Secrets não configurados.")
     st.stop()
 
 USUARIO = st.secrets["credentials"]["usuario"]
 SENHA = st.secrets["credentials"]["senha"]
 
-if st.button("Iniciar"):
+if st.button("🚀 Iniciar Automação e Acessar TISS"):
     driver = iniciar_driver()
+    
     if driver:
         try:
-            with st.status("Processando...", expanded=True) as status:
-                st.write("🌍 Acessando portal...")
+            with st.status("Executando fluxo de acesso...", expanded=True) as status:
+                
+                # PASSO 1: Portal de Login
+                st.write("🌐 Acessando o portal de login...")
                 driver.get("https://portal.amhp.com.br/")
                 wait = WebDriverWait(driver, 30)
-
-                # Preenchimento
-                st.write("🔑 Preenchendo dados...")
+                
+                # PASSO 2: Preenchimento
+                st.write("🔑 Inserindo credenciais...")
                 campo_login = wait.until(EC.presence_of_element_located((By.ID, "input-9")))
                 campo_login.send_keys(USUARIO)
                 
                 campo_senha = driver.find_element(By.ID, "input-12")
                 campo_senha.send_keys(SENHA)
-
-                # CLIQUE NO BOTÃO - NOVA ESTRATÉGIA
-                st.write("🖱️ Localizando botão de acesso...")
-                time.sleep(2) # Pausa para renderização do Vuetify
                 
-                # Procura por qualquer elemento que tenha o texto "Entrar" (independente de ser maiúsculo/minúsculo)
-                # O XPath abaixo busca o texto exato ou contido em qualquer tag
-                try:
-                    botao = wait.until(EC.element_to_be_clickable((By.XPATH, "//*[contains(text(), 'Entrar')] | //*[contains(text(), 'ENTRAR')]")))
-                    st.write("✅ Botão encontrado, clicando...")
-                    driver.execute_script("arguments[0].scrollIntoView(true);", botao)
-                    driver.execute_script("arguments[0].click();", botao)
-                except:
-                    # Se falhar, tenta clicar na classe padrão de botões do portal
-                    st.write("⚠️ Tentando seletor alternativo...")
-                    botao_alt = driver.find_element(By.CSS_SELECTOR, ".v-btn")
-                    driver.execute_script("arguments[0].click();", botao_alt)
-
-                st.write("⏳ Aguardando login...")
-                time.sleep(10)
-
-                st.write("📂 Tentando acessar AMHPTISS...")
+                # PASSO 3: Clique no Botão
+                st.write("🖱️ Localizando botão 'Entrar'...")
+                time.sleep(2) # Pausa técnica para o framework carregar o clique
+                
+                # Busca flexível por qualquer elemento com o texto 'Entrar'
+                botao = wait.until(EC.element_to_be_clickable(
+                    (By.XPATH, "//*[contains(text(), 'Entrar')] | //*[contains(text(), 'ENTRAR')]")
+                ))
+                driver.execute_script("arguments[0].click();", botao)
+                
+                # PASSO 4: Aguardar Processamento da Sessão
+                st.write("⏳ Login disparado. Aguardando processamento da sessão (10s)...")
+                time.sleep(10) 
+                
+                # PASSO 5: Acesso ao AMHPTISS
+                st.write("📂 Solicitando página do AMHPTISS...")
                 driver.get("https://amhptiss.amhp.com.br/Default.aspx")
+                
+                # PASSO 6: Verificação com Captura de Tela
                 time.sleep(5)
-
-                if "Default.aspx" in driver.current_url:
-                    st.success("✅ Login realizado com sucesso!")
+                url_final = driver.current_url
+                
+                if "Default.aspx" in url_final or "Home" in driver.title:
+                    st.success("✅ Login realizado com sucesso no AMHPTISS!")
+                    st.balloons()
+                    
+                    # Tira print para sabermos o que o robô está vendo
+                    driver.save_screenshot("tela_logada.png")
+                    st.image("tela_logada.png", caption="Visão atual do sistema logado")
+                    
+                    st.info("💡 Analise a imagem acima. Se você estiver na Home, podemos prosseguir com os menus do relatório.")
                 else:
-                    st.warning("Página atual: " + driver.current_url)
-                    driver.save_screenshot("erro.png")
-                    st.image("erro.png", caption="O que o robô está vendo agora")
-
-                status.update(label="Concluído!", state="complete", expanded=False)
+                    st.warning(f"⚠️ Redirecionamento inconclisivo. URL atual: {url_final}")
+                    driver.save_screenshot("debug_acesso.png")
+                    st.image("debug_acesso.png", caption="Tela de captura (Debug)")
+                
+                status.update(label="Fluxo Finalizado", state="complete", expanded=False)
 
         except Exception as e:
-            st.error(f"🚨 Erro: {e}")
+            st.error(f"🚨 Erro crítico: {e}")
             try:
-                driver.save_screenshot("falha_fatal.png")
-                st.image("falha_fatal.png")
+                driver.save_screenshot("erro_fatal.png")
+                st.image("erro_fatal.png", caption="Estado da tela no momento do erro")
             except: pass
         finally:
             driver.quit()
+
+# --- RODAPÉ ---
+st.markdown("---")
+st.caption("Desenvolvido para automação de faturamento médico - AMHP")
