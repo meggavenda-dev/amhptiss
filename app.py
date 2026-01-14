@@ -144,7 +144,7 @@ def _normalize_ws2(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").replace("\u00A0", " ")).strip()
 
 def is_mat_token(t: str) -> bool:
-    # Matrícula: números ou alfanum com 5+ chars (cobre casos com X)
+    # Matrícula: números ou alfanum com 5+ chars (cobre casos com X, ex.: 4X000300)
     if re.fullmatch(r"\d{5,}", t):
         return True
     return bool(re.fullmatch(r"[0-9A-Z]{5,}", t))
@@ -156,7 +156,6 @@ def split_tipo_operadora(tokens):
     """
     if not tokens:
         return "", [], 0
-
     t0 = tokens[0].lower()
     if "/" in tokens[0]:
         return tokens[0], tokens[1:], 1
@@ -245,14 +244,21 @@ def parse_record_text(rec: str):
     }
 
 def parse_relatorio_text_to_atendimentos_df(texto: str) -> pd.DataFrame:
-    """Parser principal para TODO o texto colado/obtido do ReportViewer."""
+    """
+    Parser principal para TODO o texto colado/obtido do ReportViewer.
+
+    Estratégia 1 (rápida): segmenta pelo VALOR e usa o 1º cabeçalho interno.
+    Estratégia 2 (fallback streaming): encontra TODOS os cabeçalhos
+       (Atendimento NrGuia dd/mm/yyyy hh:mm) e, para cada trecho,
+       usa o ÚLTIMO valor monetário para fechar a linha (funciona com tudo colado).
+    """
     big = _normalize_ws2(texto)
     if not big:
         return pd.DataFrame(columns=TARGET_COLS)
 
     big = re_total_blk.sub("", big)
 
-    # Segmenta por VALOR (captura o valor e o corpo anterior)
+    # ------------------ Estratégia 1: split por VALOR ------------------
     parts = re.split(rf"({val_re.pattern})", big)
     records = []
     for i in range(1, len(parts), 2):
@@ -260,7 +266,7 @@ def parse_relatorio_text_to_atendimentos_df(texto: str) -> pd.DataFrame:
         body  = _normalize_ws2(parts[i-1])
         if not body:
             continue
-        m_start = head_re.search(body)
+        m_start = head_re.search(body)  # primeiro cabeçalho dentro do bloco
         if not m_start:
             continue
         body = body[m_start.start():].strip()
@@ -274,14 +280,55 @@ def parse_relatorio_text_to_atendimentos_df(texto: str) -> pd.DataFrame:
         if row:
             parsed.append(row)
 
-    out = pd.DataFrame(parsed)
-    if not out.empty:
+    if parsed:
+        out = pd.DataFrame(parsed)
         try:
             out["Realizacao_dt"] = pd.to_datetime(out["Realizacao"], format="%d/%m/%Y", errors="coerce")
             out = out.sort_values(["Realizacao_dt","Hora"]).drop(columns=["Realizacao_dt"])
         except Exception:
             pass
-    return ensure_atendimentos_schema(sanitize_df(out))
+        return ensure_atendimentos_schema(sanitize_df(out))
+
+    # ------------------ Estratégia 2: fallback STREAMING ------------------
+    heads = list(head_re.finditer(big))
+    if not heads:
+        return pd.DataFrame(columns=TARGET_COLS)
+
+    parsed2 = []
+    for idx, m in enumerate(heads):
+        start = m.start()
+        end   = heads[idx+1].start() if (idx + 1) < len(heads) else len(big)
+        segment = big[start:end].strip()
+
+        # Pega o último valor dentro do segmento
+        vals = list(val_re.finditer(segment))
+        if not vals:
+            # Estende um pouco após o segmento (pega valor colado logo depois)
+            ext_end = min(len(big), end + max(200, int(0.1 * len(segment))))
+            segment_ext = big[start:ext_end]
+            vals = list(val_re.finditer(segment_ext))
+            if not vals:
+                continue
+            val_end_idx = vals[-1].end()
+            rec = segment_ext[:val_end_idx]
+        else:
+            val_end_idx = vals[-1].end()
+            rec = segment[:val_end_idx]
+
+        row = parse_record_text(rec)
+        if row:
+            parsed2.append(row)
+
+    out2 = pd.DataFrame(parsed2)
+    if not out2.empty:
+        try:
+            out2["Realizacao_dt"] = pd.to_datetime(out2["Realizacao"], format="%d/%m/%Y", errors="coerce")
+            out2 = out2.sort_values(["Realizacao_dt","Hora"]).drop(columns=["Realizacao_dt"])
+        except Exception:
+            pass
+        return ensure_atendimentos_schema(sanitize_df(out2))
+
+    return pd.DataFrame(columns=TARGET_COLS)
 
 def to_float_br(s):
     try:
@@ -444,7 +491,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                     header_y = None
                     header_words = []
                     for w in words:
-                        if "Atendimento" in w["text"]:
+                        if "Atendimento" in w["text"]]:
                             y_top = w["top"]
                             band = [ww for ww in words if abs(ww["top"] - y_top) <= TOP_TOL]
                             band_text = " ".join([b["text"] for b in band])
@@ -964,8 +1011,20 @@ if not st.session_state.db_consolidado.empty:
     st.subheader("📊 Base consolidada (temporária)")
     st.dataframe(df_preview, use_container_width=True)
 
+    # CSV
     csv_bytes = df_preview.to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button("💾 Baixar Consolidação (CSV)", csv_bytes, file_name="consolidado_amhp.csv", mime="text/csv")
+
+    # Excel
+    xlsx_io = io.BytesIO()
+    with pd.ExcelWriter(xlsx_io, engine="openpyxl") as writer:
+        df_preview.to_excel(writer, index=False, sheet_name="Atendimentos")
+    st.download_button(
+        "📘 Baixar Consolidação (Excel)",
+        xlsx_io.getvalue(),
+        file_name="consolidado_amhp.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
     if st.button("🗑️ Limpar Banco Temporário"):
         st.session_state.db_consolidado = pd.DataFrame()
