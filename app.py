@@ -396,4 +396,9 @@ if not st.session_state.db_consolidado.empty:
     st.divider()
     df_preview = sanitize_df(st.session_state.db_consolidado)
     st.subheader("📊 Base consolidada (temporária)")
-    st.dataframe(df_preview),
+    st.dataframe(df_preview, use_container_width=True)
+
+    csv_bytes = df_preview.to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig")
+    st.download_button("💾 Baixar Consolidação (CSV)", csv_bytes,    file_name="consolidado_amhp.csv",
+        mime="text/csv"
+    )
