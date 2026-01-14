@@ -2,8 +2,9 @@ streamlit
 pandas
 selenium
 xlrd==2.0.1
-xlsxwriter
 openpyxl
+xlsxwriter
+pdfplumber
+PyPDF2
 lxml
 beautifulsoup4
-pdfplumber
