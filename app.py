@@ -44,7 +44,7 @@ os.makedirs(DOWNLOAD_TEMPORARIO, exist_ok=True)
 # ========= Sanitização =========
 _ILLEGAL_CTRL_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
 
-def _sanitize_text(s):
+def _sanitize_text(s: str) -> str:
     if s is None:
         return s
     s = s.replace("\x00", "")
@@ -64,7 +64,7 @@ def sanitize_value(v):
         return _sanitize_text(v)
     return v
 
-def sanitize_df(df):
+def sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     new_cols, seen = [], {}
     for c in df.columns:
@@ -84,7 +84,7 @@ TARGET_COLS = [
     "Prestador","ValorTotal"
 ]
 
-def _norm_key(s):
+def _norm_key(s: str) -> str:
     if not s: return ""
     t = s.lower().strip()
     t = (t.replace("á","a").replace("à","a").replace("â","a").replace("ã","a")
@@ -119,7 +119,7 @@ SYNONYMS = {
     "total": "ValorTotal",
 }
 
-def ensure_atendimentos_schema(df):
+def ensure_atendimentos_schema(df: pd.DataFrame) -> pd.DataFrame:
     """
     Garante as 11 colunas da Tabela — Atendimentos.
     Renomeia sinônimos, cria colunas faltantes e reordena.
@@ -182,39 +182,35 @@ def safe_click(driver, locator, timeout=30):
         driver.execute_script("arguments[0].click();", el)
         return el
 
-# ========= PDF → Tabela por colunas (pdfplumber, multipage, robusto) =========
-def parse_pdf_to_atendimentos_df(pdf_path, debug=False):
+# ========= PDF → Tabela (coordenadas + fallback textual) =========
+def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool = False) -> pd.DataFrame:
     """
-    Extrai a Tabela — Atendimentos do PDF (SSRS) de forma robusta:
-    1) pdfplumber por coordenadas (todas as páginas), com tolerâncias:
-       - bandas horizontais (linhas) por aproximação de 'top'
-       - colunas por interseção de caixas (x0/x1) com margem
-    2) Fallback textual via PyPDF2 + heurísticas (regex) caso o grid falhe.
-    Em todos os casos, aplica ensure_atendimentos_schema() antes de retornar.
+    mode: "coord" (coordenadas, padrão) | "text" (fallback textual forçado)
+    Sempre aplica ensure_atendimentos_schema() antes de retornar.
     """
     import pdfplumber
     from PyPDF2 import PdfReader
 
-    TOP_TOL      = 3.5     # tolerância vertical (pts) para agrupar palavras na mesma linha
-    MERGE_GAP_X  = 8.0     # para fundir palavras do cabeçalho em um bloco
-    COL_MARGIN   = 2.5     # margem lateral para considerar interseção com coluna
+    # Tolerâncias
+    TOP_TOL      = 4.5     # ↑ um pouco para PDFs do SSRS
+    MERGE_GAP_X  = 10.0
+    COL_MARGIN   = 4.0
 
     val_re        = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}$")
     code_start_re = re.compile(r"\d{3,6}-")
-    all_records   = []
 
-    # ---------- 1) Coordenadas ----------
-    try:
+    def parse_by_coords() -> pd.DataFrame:
+        all_records = []
         with pdfplumber.open(pdf_path) as pdf:
             for page_i, page in enumerate(pdf.pages, start=1):
                 words = page.extract_words(
                     use_text_flow=True,
-                    extra_attrs=["x0", "x1", "top", "bottom"]
+                    extra_attrs=["x0","x1","top","bottom"]
                 )
                 if not words:
                     continue
 
-                # Cabeçalho
+                # 1) Cabeçalho
                 header_y = None
                 header_words = []
                 for w in words:
@@ -227,7 +223,7 @@ def parse_pdf_to_atendimentos_df(pdf_path, debug=False):
                             header_words = sorted(band, key=lambda z: z["x0"])
                             break
 
-                # Fallback extract_tables se não achou cabeçalho
+                # Fallback extract_tables
                 if header_y is None or not header_words:
                     tbls = page.extract_tables()
                     if tbls:
@@ -239,10 +235,10 @@ def parse_pdf_to_atendimentos_df(pdf_path, debug=False):
                             for _, r in df.iterrows():
                                 all_records.append({k: str(r.get(k, "")).strip() for k in TARGET_COLS})
                             if debug:
-                                st.info(f"[pdfplumber] extract_tables usado na página {page_i}.")
+                                st.info(f"[coord] extract_tables usado na página {page_i}.")
                     continue
 
-                # Blocos do cabeçalho
+                # 2) Blocos do cabeçalho
                 blocks = []
                 cur = [header_words[0]]
                 for w in header_words[1:]:
@@ -281,21 +277,20 @@ def parse_pdf_to_atendimentos_df(pdf_path, debug=False):
                         columns.append({"name": name, "x0": hb["x0"], "x1": hb["x1"]})
                 columns = sorted(columns, key=lambda c: c["x0"])
                 if not columns:
-                    if debug:
-                        st.warning("Nenhuma coluna mapeada a partir do cabeçalho.")
+                    if debug: st.warning("Nenhuma coluna mapeada a partir do cabeçalho.")
                     continue
 
                 if debug:
-                    st.info(f"Colunas detectadas (página {page_i}): {[c['name'] for c in columns]}")
+                    st.info(f"[coord] Colunas detectadas (página {page_i}): {[c['name'] for c in columns]}")
 
-                # Palavras de dados (abaixo do cabeçalho); corta antes de "Total"
+                # 3) Palavras de dados; corta 'Total'
                 data_words = [w for w in words if w["top"] > header_y + TOP_TOL]
                 total_candidates = [w for w in data_words if w["text"].lower() == "total"]
                 if total_candidates:
                     total_y = total_candidates[0]["top"]
                     data_words = [w for w in data_words if w["top"] < total_y - TOP_TOL]
 
-                # Bandas horizontais (linhas)
+                # 4) Bandas (linhas)
                 rows = []
                 band = []
                 last_top = None
@@ -306,28 +301,39 @@ def parse_pdf_to_atendimentos_df(pdf_path, debug=False):
                         rows.append(band); band = [w]; last_top = w["top"]
                 if band: rows.append(band)
 
-                # Interseção com a faixa da coluna
-                def intersects(w, col):
-                    return not (w["x1"] < (col["x0"] - COL_MARGIN) or w["x0"] > (col["x1"] + COL_MARGIN))
+                # 5) Atribuição de palavras à coluna por centro mais próximo (mais robusto)
+                col_centers = [(c["name"], (c["x0"] + c["x1"]) / 2.0) for c in columns]
 
-                # Coleta por coluna
+                def assign_to_nearest_col(w):
+                    wc = (w["x0"] + w["x1"]) / 2.0
+                    name, dist = None, 1e9
+                    for cname, cc in col_centers:
+                        d = abs(wc - cc)
+                        if d < dist: name, dist = cname, d
+                    return name
+
                 for row_words in rows:
-                    cols_text = {}
-                    for col in columns:
-                        col_words = [w for w in row_words if intersects(w, col)]
-                        txt = " ".join([w["text"] for w in sorted(col_words, key=lambda z: z["x0"])])
-                        cols_text[col["name"]] = txt.strip()
+                    bucket = {c["name"]: [] for c in columns}
+                    for w in row_words:
+                        cname = assign_to_nearest_col(w)
+                        # extra: se estiver muito fora (nenhuma coluna “próxima”), usa interseção com margem
+                        if cname is None:
+                            for c in columns:
+                                intersects = not (w["x1"] < (c["x0"] - COL_MARGIN) or w["x0"] > (c["x1"] + COL_MARGIN))
+                                if intersects:
+                                    cname = c["name"]; break
+                        if cname is None:  # se ainda não caiu em nenhuma, ignora
+                            continue
+                        bucket[cname].append(w)
+
+                    cols_text = {k: " ".join([ww["text"] for ww in sorted(v, key=lambda z: z["x0"])]) for k, v in bucket.items()}
 
                     # precisa ter ValorTotal válido
                     if not cols_text.get("ValorTotal") or not val_re.search(cols_text["ValorTotal"]):
                         continue
 
                     # Ajuste Credenciado/Prestador por padrão CODIGO-Nome
-                    tail = " ".join([
-                        cols_text.get("Beneficiario",""),
-                        cols_text.get("Credenciado",""),
-                        cols_text.get("Prestador",""),
-                    ]).strip()
+                    tail = " ".join([cols_text.get("Beneficiario",""), cols_text.get("Credenciado",""), cols_text.get("Prestador","")]).strip()
                     starts = [m.start() for m in code_start_re.finditer(tail)]
                     cred = cols_text.get("Credenciado","").strip()
                     prest = cols_text.get("Prestador","").strip()
@@ -349,12 +355,11 @@ def parse_pdf_to_atendimentos_df(pdf_path, debug=False):
                         "Prestador":     prest,
                         "ValorTotal":    cols_text.get("ValorTotal","").strip(),
                     })
-    except Exception as e:
-        if debug:
-            st.error(f"[pdfplumber] Falha coordenadas: {e}")
 
-    # Se já conseguimos algo por coordenadas, retorna
-    if all_records:
+                if debug and all_records:
+                    st.caption(f"[coord] Amostra da última linha (página {page_i}):")
+                    st.write(all_records[-1])
+
         out = pd.DataFrame(all_records)
         if not out.empty:
             try:
@@ -362,11 +367,9 @@ def parse_pdf_to_atendimentos_df(pdf_path, debug=False):
                 out = out.sort_values(["Realizacao_dt","Hora"]).drop(columns=["Realizacao_dt"])
             except Exception:
                 pass
-        out = ensure_atendimentos_schema(out)
-        return sanitize_df(out)
+        return ensure_atendimentos_schema(out)
 
-    # ---------- 2) FALLBACK TEXTUAL ----------
-    try:
+    def parse_by_text() -> pd.DataFrame:
         reader = PdfReader(open(pdf_path, "rb"))
         lines = []
         for page in reader.pages:
@@ -389,9 +392,6 @@ def parse_pdf_to_atendimentos_df(pdf_path, debug=False):
             data_lines.append(l)
 
         parsed_rows = []
-        val_re = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}$")
-        code_start_re = re.compile(r"\d{3,6}-")
-
         for l in data_lines:
             m_val = val_re.search(l)
             if not m_val:
@@ -468,15 +468,18 @@ def parse_pdf_to_atendimentos_df(pdf_path, debug=False):
                 out = out.sort_values(["Realizacao_dt","Hora"]).drop(columns=["Realizacao_dt"])
             except Exception:
                 pass
-        out = ensure_atendimentos_schema(out)
-        return sanitize_df(out)
+        return ensure_atendimentos_schema(out)
 
-    except Exception as e:
-        if debug:
-            st.error(f"[PyPDF2] Falha textual: {e}")
+    # Seleção de modo
+    if mode == "text":
+        return sanitize_df(parse_by_text())
 
-    # nada deu — retorna vazio com esquema
-    return ensure_atendimentos_schema(pd.DataFrame())
+    # Tenta coordenadas; se vazio, força fallback textual
+    out = parse_by_coords()
+    if out.empty:
+        if debug: st.warning("Nenhuma linha por coordenadas — aplicando fallback textual.")
+        out = parse_by_text()
+    return sanitize_df(out)
 
 # ========= UI =========
 with st.sidebar:
@@ -491,18 +494,20 @@ with st.sidebar:
     )
     wait_time_main     = st.number_input("⏱️ Tempo extra pós login/troca de tela (s)", min_value=0, value=10)
     wait_time_download = st.number_input("⏱️ Tempo extra para concluir download (s)", min_value=10, value=18)
+    extraction_mode    = st.selectbox("🧠 Modo de extração do PDF", ["Coordenadas (recomendado)", "Texto (fallback)"])
     debug_parser       = st.checkbox("🧪 Debug do parser PDF", value=False)
 
-# ========= (Opcional) Processar PDF manualmente (sem automação) =========
-with st.expander("🧪 Processar PDF manualmente (upload) — útil para teste do parser", expanded=False):
+# ========= (Opcional) Processar PDF manualmente =========
+with st.expander("🧪 Testar parser com upload de PDF (sem automação)", expanded=False):
     up = st.file_uploader("Envie um PDF do AMHPTISS para teste", type=["pdf"])
     if up and st.button("Processar PDF (teste)"):
         tmp_pdf = os.path.join(DOWNLOAD_TEMPORARIO, "teste_upload.pdf")
         with open(tmp_pdf, "wb") as f:
             f.write(up.getvalue())
-        df_test = parse_pdf_to_atendimentos_df(tmp_pdf, debug=debug_parser)
+        mode = "text" if extraction_mode.startswith("Texto") else "coord"
+        df_test = parse_pdf_to_atendimentos_df(tmp_pdf, mode=mode, debug=debug_parser)
         if df_test.empty:
-            st.error("Parser não conseguiu extrair linhas deste PDF. Ajuste as tolerâncias ou me envie o arquivo para calibrar.")
+            st.error("Parser não conseguiu extrair linhas deste PDF. Ajuste tolerâncias ou use o outro modo.")
         else:
             st.success(f"{len(df_test)} linha(s) extraída(s).")
             st.dataframe(df_test, use_container_width=True)
@@ -514,14 +519,14 @@ if st.button("🚀 Iniciar Processo (PDF)"):
         with st.status("Executando automação...", expanded=True) as status:
             wait = WebDriverWait(driver, 40)
 
-            # 1. Login
+            # 1) Login
             st.write("🔑 Fazendo login...")
             driver.get("https://portal.amhp.com.br/")
             wait.until(EC.presence_of_element_located((By.ID, "input-9"))).send_keys(st.secrets["credentials"]["usuario"])
             driver.find_element(By.ID, "input-12").send_keys(st.secrets["credentials"]["senha"] + Keys.ENTER)
             time.sleep(wait_time_main)
 
-            # 2. AMHPTISS
+            # 2) AMHPTISS
             st.write("🔄 Acessando TISS...")
             try:
                 btn_tiss = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'AMHPTISS')]")))
@@ -536,7 +541,7 @@ if st.button("🚀 Iniciar Processo (PDF)"):
             if len(driver.window_handles) > 1:
                 driver.switch_to.window(driver.window_handles[-1])
 
-            # 3. Limpeza
+            # 3) Limpeza
             st.write("🧹 Limpando tela...")
             try:
                 driver.execute_script("""
@@ -546,7 +551,7 @@ if st.button("🚀 Iniciar Processo (PDF)"):
             except Exception:
                 pass
 
-            # 4. Navegação
+            # 4) Navegação
             st.write("📂 Abrindo Atendimentos...")
             driver.execute_script("document.getElementById('IrPara').click();")
             time.sleep(2)
@@ -554,7 +559,7 @@ if st.button("🚀 Iniciar Processo (PDF)"):
             safe_click(driver, (By.XPATH, "//a[@href='AtendimentosRealizados.aspx']"))
             time.sleep(3)
 
-            # 5. Loop de Status
+            # 5) Loop de Status
             for status_sel in status_list:
                 st.write(f"📝 Filtros → Negociação: **{negociacao}**, Status: **{status_sel}**, Período: **{data_ini}–{data_fim}**")
 
@@ -601,7 +606,8 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                     st.success(f"✅ PDF salvo: {destino_pdf}")
 
                     st.write("📄 Extraindo Tabela — Atendimentos do PDF...")
-                    df_pdf = parse_pdf_to_atendimentos_df(destino_pdf, debug=debug_parser)
+                    mode = "text" if extraction_mode.startswith("Texto") else "coord"
+                    df_pdf = parse_pdf_to_atendimentos_df(destino_pdf, mode=mode, debug=debug_parser)
 
                     if not df_pdf.empty:
                         # Metadados
@@ -624,7 +630,7 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                         st.session_state.db_consolidado = pd.concat([st.session_state.db_consolidado, df_pdf], ignore_index=True)
                         st.write(f"📊 Registros acumulados: {len(st.session_state.db_consolidado)}")
                     else:
-                        st.warning("⚠️ Não foi possível extrair linhas do PDF. Verifique o arquivo salvo.")
+                        st.warning("⚠️ Não foi possível extrair linhas do PDF. Tente o outro modo de extração e/ou ajuste tolerâncias.")
 
                     try:
                         driver.switch_to.default_content()
