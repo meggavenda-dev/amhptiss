@@ -144,56 +144,42 @@ re_total_blk  = re.compile(r"total\s*r\$\s*\d{1,3}(?:\.\d{3})*,\d{2}", re.I)
 def _normalize_ws2(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").replace("\u00A0", " ")).strip()
 
-# ---------- PRÉ-LIMPEZA ROBUSTA DO TEXTO (chave p/ dados “colados”) ----------
+# ---------- PRÉ-LIMPEZA ROBUSTA DO TEXTO ----------
 def _preclean_report_text(raw: str) -> str:
     """
     - Corta preâmbulo (filtros) até o cabeçalho da tabela.
     - Insere espaço entre Data e Hora quando coladas.
-    - Insere espaço entre Hora e o próximo token alfabético (Tipo de Guia) quando coladas.
+    - Insere espaço entre Hora e Tipo de Guia quando coladas.
     - Normaliza whitespace.
     """
     if not raw:
         return ""
-
     txt = raw.replace("\u00A0", " ")
     txt = _ILLEGAL_CTRL_RE.sub("", txt)
 
-    # 1) Corta tudo antes do cabeçalho da tabela (Atendimento… Valor Total)
-    # Busca um marcador robusto de início da grade
-    idx = None
+    # Corta antes do cabeçalho da grade
     m = re.search(r"(Atendimento\s*Nr\.?\s*Guia.*?Valor\s*Total)", txt, flags=re.I|re.S)
     if m:
-        idx = m.start()
+        txt = txt[m.start():]
     else:
-        # fallback: procure por primeira data dd/mm/yyyy seguida de hora e “Consulta|SP/SADT|Honorário|Não”
         m2 = re.search(r"\d{2}/\d{2}/\d{4}\s*\d{2}:\d{2}\s*(Consulta|SP/SADT|Honorário|Não)", txt, flags=re.I)
         if m2:
-            idx = max(0, m2.start()-30)
-    if idx is not None:
-        txt = txt[idx:]
+            txt = txt[max(0, m2.start()-30):]
 
-    # 2) Inserir espaço entre Data e Hora quando vierem coladas: 01/12/202508:43 -> 01/12/2025 08:43
+    # Espaço entre Data e Hora coladas
     txt = re.sub(r"(\d{2}/\d{2}/\d{4})(\d{2}:\d{2})", r"\1 \2", txt)
-
-    # 3) Inserir espaço entre Hora e próximo token alfabético (p.ex. “Consulta”, “SP/SADT”, “Honorário”, “Não”)
+    # Espaço entre Hora e TipoGuia colados
     txt = re.sub(r"(\d{2}:\d{2})(?=[A-Za-zÁ-Úá-úNÇS/])", r"\1 ", txt)
-
-    # 4) Normalizar múltiplos espaços
+    # Normaliza
     txt = _normalize_ws2(txt)
-
     return txt
 
 def is_mat_token(t: str) -> bool:
-    # Matrícula: números ou alfanum com 5+ chars (cobre casos com X, ex.: 4X000300)
     if re.fullmatch(r"\d{5,}", t):
         return True
     return bool(re.fullmatch(r"[0-9A-Z]{5,}", t))
 
 def split_tipo_operadora(tokens):
-    """
-    Heurística para separar TipoGuia e Operadora antes da matrícula.
-    Cobre: 'Consulta', 'SP/SADT', 'Honorário Individual', 'Não TISS - Atendimento'.
-    """
     if not tokens:
         return "", [], 0
     t0 = tokens[0].lower()
@@ -213,18 +199,15 @@ def split_tipo_operadora(tokens):
     return tokens[0], tokens[1:], 1
 
 def parse_record_text(rec: str):
-    """Converte uma linha textual em colunas da Tabela — Atendimentos."""
     rec = _normalize_ws2(rec)
     rec = re_total_blk.sub("", rec)
 
-    # Valor (última ocorrência)
     m_vals = list(val_re.finditer(rec))
     if not m_vals:
         return None
     valor = m_vals[-1].group(0)
     body  = rec[:m_vals[-1].start()].strip()
 
-    # Credenciado/Prestador pelos blocos "CODIGO-"
     codes = list(code_start_re.finditer(body))
     if len(codes) >= 2:
         i1, i2 = codes[-2].start(), codes[-1].start()
@@ -239,13 +222,11 @@ def parse_record_text(rec: str):
     else:
         prest = cred = ""
 
-    # Cabeçalho line: Atendimento / NrGuia / Data / Hora / resto
     m_head = head_re.search(body)
     if not m_head:
         return None
     atendimento, nr_guia, realizacao, hora, rest = m_head.groups()
 
-    # Tipo/Operadora/Matrícula/Beneficiário
     toks = rest.split()
     tipo, tail, _ = split_tipo_operadora(toks)
 
@@ -261,7 +242,6 @@ def parse_record_text(rec: str):
         beneficiario = ""
     else:
         operadora = " ".join(tail[:idx_mat]).strip()
-        # Matricula pode ter múltiplos tokens contíguos
         k = idx_mat
         mat_tokens = []
         while k < len(tail) and is_mat_token(tail[k]):
@@ -285,27 +265,21 @@ def parse_record_text(rec: str):
 
 def parse_relatorio_text_to_atendimentos_df(texto: str, debug_heads: bool = False) -> pd.DataFrame:
     """
-    Parser principal para TODO o texto colado/obtido do ReportViewer.
-
-    Estratégia 0: PRÉ-LIMPEZA — insere espaços entre tokens críticos e corta o preâmbulo.
-    Estratégia 1 (rápida): segmenta pelo VALOR e usa o 1º cabeçalho interno.
-    Estratégia 2 (fallback streaming): encontra TODOS os cabeçalhos
-       (Atendimento NrGuia dd/mm/yyyy hh:mm) e, para cada trecho,
-       usa o ÚLTIMO valor monetário para fechar a linha.
+    Parser principal:
+    0) Pré-limpeza
+    1) Split por valor + 1º cabeçalho interno
+    2) Fallback streaming por cabeçalhos e último valor
     """
-    big_raw = texto or ""
-    big = _preclean_report_text(big_raw)
+    big = _preclean_report_text(texto or "")
     if not big:
         return pd.DataFrame(columns=TARGET_COLS)
-
     big = re_total_blk.sub("", big)
 
-    # Debug opcional: quantos cabeçalhos há no texto pré-limpado
     if debug_heads:
         heads_test = list(head_re.finditer(big))
         st.caption(f"🧩 Cabeçalhos detectados (pré-limpeza): {len(heads_test)}")
 
-    # ------------------ Estratégia 1: split por VALOR ------------------
+    # Estratégia 1
     parts = re.split(rf"({val_re.pattern})", big)
     records = []
     for i in range(1, len(parts), 2):
@@ -313,7 +287,7 @@ def parse_relatorio_text_to_atendimentos_df(texto: str, debug_heads: bool = Fals
         body  = _normalize_ws2(parts[i-1])
         if not body:
             continue
-        m_start = head_re.search(body)  # primeiro cabeçalho dentro do bloco
+        m_start = head_re.search(body)
         if not m_start:
             continue
         body = body[m_start.start():].strip()
@@ -336,7 +310,7 @@ def parse_relatorio_text_to_atendimentos_df(texto: str, debug_heads: bool = Fals
             pass
         return ensure_atendimentos_schema(sanitize_df(out))
 
-    # ------------------ Estratégia 2: fallback STREAMING ------------------
+    # Estratégia 2
     heads = list(head_re.finditer(big))
     if debug_heads:
         st.caption(f"🧩 Cabeçalhos detectados (streaming): {len(heads)}")
@@ -349,7 +323,6 @@ def parse_relatorio_text_to_atendimentos_df(texto: str, debug_heads: bool = Fals
         end   = heads[idx+1].start() if (idx + 1) < len(heads) else len(big)
         segment = big[start:end].strip()
 
-        # Pega o último valor dentro do segmento; se não achar, estende um pouco após
         vals = list(val_re.finditer(segment))
         if not vals:
             ext_end = min(len(big), end + max(200, int(0.1 * len(segment))))
@@ -582,7 +555,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                         if "nr" in t and "guia" in t:            return "NrGuia"
                         if "realiza" in t:                       return "Realizacao"
                         if "hora" in t:                          return "Hora"
-                        if "tipo" in t e "guia" in t:            return "TipoGuia"
+                        if "tipo" in t and "guia" in t:          return "TipoGuia"
                         if "operadora" in t:                     return "Operadora"
                         if "matr" in t:                          return "Matricula"
                         if "benef" in t:                         return "Beneficiario"
