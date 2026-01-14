@@ -1,4 +1,5 @@
 
+# app.py
 # -*- coding: utf-8 -*-
 import os, io, re, time, shutil
 import streamlit as st
@@ -170,7 +171,7 @@ def _preclean_report_text(raw: str) -> str:
     # Espaço entre Hora e próximo token alfabético (Tipo de Guia)
     txt = re.sub(r"(\d{2}:\d{2})(?=[A-Za-zÁ-Úá-úNÇS/])", r"\1 ", txt)
 
-    # Espaço entre Tipo de Guia e Operadora coladas (ex.: 'SP/SADTBACEN(' -> 'SP/SADT BACEN(' ; 'ConsultaAFFEGO(' -> 'Consulta AFFEGO(')
+    # Espaço entre Tipo de Guia e Operadora coladas
     txt = re.sub(r"([A-Za-zÁ-Úá-ú/])([A-Z]{2,}\()", r"\1 \2", txt)
 
     # Espaço entre ')' e matrícula coladas
@@ -281,7 +282,7 @@ def parse_record_text(rec: str):
 
 def parse_relatorio_text_to_atendimentos_df(texto: str, debug_heads: bool = False) -> pd.DataFrame:
     """
-    Parser principal:
+    Parser principal (antigo):
     0) Pré-limpeza
     1) Split por valor + 1º cabeçalho interno
     2) Fallback streaming por cabeçalhos e último valor
@@ -372,6 +373,139 @@ def to_float_br(s):
         return float(str(s).replace('.', '').replace(',', '.'))
     except Exception:
         return 0.0
+
+# ========= NOVO PARSER UNIFICADO (streaming) =========
+# Detecta cabeçalho colado ou separado automaticamente.
+_HDR_PAT_COLADO   = re.compile(r"(\d{10,})\s*(\d{2}/\d{2}/\d{4})\s*(\d{2}:\d{2})")
+_HDR_PAT_SEPARADO = re.compile(r"(\d{6,})\s+(\d{6,})\s+(\d{2}/\d{2}/\d{4})\s*(\d{2}:\d{2})")
+_VAL_RE_UNI       = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")
+_CODE_START_UNI   = re.compile(r"\d{3,6}-")
+
+def split_tipo_operadora_any(tokens):
+    """Versão simples para separar TipoGuia e Operadora quando colados."""
+    if not tokens:
+        return "", [], 0
+    t0 = tokens[0].lower()
+    if "/" in tokens[0]:
+        return tokens[0], tokens[1:], 1
+    if t0 in ("consulta", "sp/sadt", "honorário", "não", "não tiss", "não tiss - atendimento"):
+        return tokens[0], tokens[1:], 1
+    return tokens[0], tokens[1:], 1
+
+def parse_streaming_any(texto: str) -> pd.DataFrame:
+    """
+    Parser unificado: detecta cabeçalho colado (bloco numérico único + data + hora)
+    ou separado (Atendimento NrGuia + data + hora).
+    Retorna DataFrame com schema padronizado (TARGET_COLS).
+    """
+    if not texto or not str(texto).strip():
+        return pd.DataFrame(columns=TARGET_COLS)
+
+    s = texto.replace("\u00A0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+
+    m_colado = list(_HDR_PAT_COLADO.finditer(s))
+    m_sep    = list(_HDR_PAT_SEPARADO.finditer(s))
+    matches    = m_colado if len(m_colado) >= len(m_sep) else m_sep
+    use_colado = (matches is m_colado)
+
+    rows = []
+    for i, m in enumerate(matches):
+        start = m.start()
+        end   = matches[i+1].start() if (i+1) < len(matches) else len(s)
+        seg   = s[start:end]
+
+        vals  = list(_VAL_RE_UNI.finditer(seg))
+        if not vals:
+            seg_ext = s[start:min(len(s), end + 40)]
+            vals    = list(_VAL_RE_UNI.finditer(seg_ext))
+            if not vals:
+                continue
+            last_val   = vals[-1].group(0)
+            val_start  = vals[-1].start()
+            working    = seg_ext[:val_start].strip()
+        else:
+            last_val   = vals[-1].group(0)
+            val_start  = vals[-1].start()
+            working    = seg[:val_start].strip()
+
+        if use_colado:
+            digits_block, data, hora = m.groups()
+            if len(digits_block) <= 8:
+                atendimento = digits_block
+                nr_guia     = ""
+            else:
+                atendimento = digits_block[:-8]
+                nr_guia     = digits_block[-8:]
+        else:
+            atendimento, nr_guia, data, hora = m.groups()
+
+        hpos = working.find(hora)
+        rest = working[hpos + len(hora):].strip()
+        rest = re.sub(r"(Consulta|SP/SADT)(?=[A-Z]{2,}\()", r"\1 ", rest)
+
+        body  = rest
+        codes = list(_CODE_START_UNI.finditer(body))
+        if len(codes) >= 2:
+            i1, i2 = codes[-2].start(), codes[-1].start()
+            prest  = body[i2:].strip()
+            cred   = body[i1:i2].strip()
+            core   = body[:i1].strip()
+        elif len(codes) == 1:
+            i2     = codes[-1].start()
+            prest  = body[i2:].strip()
+            cred   = ""
+            core   = body[:i2].strip()
+        else:
+            prest  = ""
+            cred   = ""
+            core   = body
+
+        toks = core.split()
+        tipo, tail, _ = split_tipo_operadora_any(toks)
+
+        idx_mat = None
+        for j, t in enumerate(tail):
+            if is_mat_token(t):
+                idx_mat = j
+                break
+        if idx_mat is None:
+            operadora    = " ".join(tail).strip()
+            matricula    = ""
+            beneficiario = ""
+        else:
+            operadora = " ".join(tail[:idx_mat]).strip()
+            k = idx_mat
+            mat_tokens = []
+            while k < len(tail) and is_mat_token(tail[k]):
+                mat_tokens.append(tail[k]); k += 1
+            matricula    = " ".join(mat_tokens).strip()
+            beneficiario = " ".join(tail[k:]).strip()
+
+        rows.append({
+            "Atendimento":  atendimento,
+            "NrGuia":       nr_guia,
+            "Realizacao":   data,
+            "Hora":         hora,
+            "TipoGuia":     tipo,
+            "Operadora":    operadora,
+            "Matricula":    matricula,
+            "Beneficiario": beneficiario,
+            "Credenciado":  cred,
+            "Prestador":    prest,
+            "ValorTotal":   last_val,
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=TARGET_COLS)
+
+    try:
+        df["Realizacao_dt"] = pd.to_datetime(df["Realizacao"], format="%d/%m/%Y", errors="coerce")
+        df = df.sort_values(["Realizacao_dt", "Hora"]).drop(columns=["Realizacao_dt"])
+    except Exception:
+        pass
+    return ensure_atendimentos_schema(sanitize_df(df))
 
 # ========= Selenium =========
 def configurar_driver():
@@ -810,6 +944,10 @@ with st.sidebar:
     debug_parser       = st.checkbox("🧪 Debug do parser PDF", value=False)
     debug_heads        = st.checkbox("🧩 Mostrar contagem de cabeçalhos detectados (modo TEXTO)", value=True)
 
+    # 🔘 NOVO TOGGLE — Forçar parser streaming unificado
+    force_streaming    = st.toggle("⚙️ Forçar parser streaming (texto colado/sem espaços)", value=True)
+    st.caption("Ligado: usa o parser unificado `parse_streaming_any(texto)`.\nDesligado: usa o parser atual `parse_relatorio_text_to_atendimentos_df(texto)`.")
+
 # ========= (Opcional) Processar TEXTO manualmente =========
 with st.expander("🧪 Colar TEXTO do relatório (sem automação)", expanded=False):
     texto_manual = st.text_area("📋 Cole aqui o texto completo do ReportViewer:", height=250)
@@ -817,7 +955,12 @@ with st.expander("🧪 Colar TEXTO do relatório (sem automação)", expanded=Fa
         if not texto_manual.strip():
             st.warning("Cole o texto do relatório e tente novamente.")
         else:
-            df_txt = parse_relatorio_text_to_atendimentos_df(texto_manual, debug_heads=debug_heads)
+            # 🔁 Usa o toggle para decidir o parser
+            if force_streaming:
+                df_txt = parse_streaming_any(texto_manual)
+            else:
+                df_txt = parse_relatorio_text_to_atendimentos_df(texto_manual, debug_heads=debug_heads)
+
             if df_txt.empty:
                 st.error("Parser não conseguiu extrair linhas deste TEXTO.")
             else:
@@ -937,7 +1080,11 @@ if st.button("🚀 Iniciar Processo"):
                         continue
 
                     st.write("📄 Processando TEXTO do relatório...")
-                    df_txt = parse_relatorio_text_to_atendimentos_df(texto_relatorio, debug_heads=debug_heads)
+                    # 🔁 Usa o toggle para decidir o parser
+                    if force_streaming:
+                        df_txt = parse_streaming_any(texto_relatorio)
+                    else:
+                        df_txt = parse_relatorio_text_to_atendimentos_df(texto_relatorio, debug_heads=debug_heads)
 
                     if not df_txt.empty:
                         # Metadados
