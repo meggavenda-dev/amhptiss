@@ -133,24 +133,36 @@ def ensure_atendimentos_schema(df: pd.DataFrame) -> pd.DataFrame:
     df2 = df2[TARGET_COLS]
     return df2
 
-# ========= Selenium =========
+# ========= Selenium (CLOUD SAFE) =========
 def configurar_driver():
     opts = Options()
-    chrome_binary  = os.environ.get("CHROME_BINARY", "/usr/bin/chromium")
-    driver_binary  = os.environ.get("CHROMEDRIVER_BINARY", "/usr/bin/chromedriver")
+    chrome_binary = os.environ.get("CHROME_BINARY", "/usr/bin/chromium")
+    driver_binary = os.environ.get("CHROMEDRIVER_BINARY", "/usr/bin/chromedriver")
+
     if os.path.exists(chrome_binary):
         opts.binary_location = chrome_binary
 
-    opts.add_argument("--headless")
+    opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-software-rasterizer")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--disable-sync")
+    opts.add_argument("--disable-translate")
+    opts.add_argument("--disable-features=VizDisplayCompositor")
+    opts.add_argument("--disable-features=NetworkService")
+    opts.add_argument("--disable-features=NetworkServiceInProcess")
+    opts.add_argument("--disable-print-preview")
     opts.add_argument("--window-size=1920,1080")
 
     prefs = {
         "download.default_directory": DOWNLOAD_TEMPORARIO,
         "download.prompt_for_download": False,
-        "safebrowsing.enabled": True,
+        "plugins.always_open_pdf_externally": True,
         "profile.default_content_setting_values.automatic_downloads": 1,
+        "safebrowsing.enabled": True,
     }
     opts.add_experimental_option("prefs", prefs)
 
@@ -160,22 +172,75 @@ def configurar_driver():
     else:
         driver = webdriver.Chrome(options=opts)
 
-    driver.set_page_load_timeout(60)
+    driver.set_page_load_timeout(180)
+    driver.set_script_timeout(180)
     return driver
-
-def wait_visible(driver, locator, timeout=30):
-    return WebDriverWait(driver, timeout).until(EC.visibility_of_element_located(locator))
 
 def safe_click(driver, locator, timeout=30):
     try:
         el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable(locator))
         el.click()
         return el
-    except (ElementClickInterceptedException, TimeoutException, WebDriverException):
+    except Exception:
         el = WebDriverWait(driver, timeout).until(EC.presence_of_element_located(locator))
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
         driver.execute_script("arguments[0].click();", el)
         return el
+
+# ========= UI =========
+with st.sidebar:
+    st.header("Configurações")
+    data_ini    = st.text_input("📅 Data Inicial (dd/mm/aaaa)", value="01/01/2026")
+    data_fim    = st.text_input("📅 Data Final (dd/mm/aaaa)", value="13/01/2026")
+    negociacao  = st.text_input("🤝 Tipo de Negociação", value="Direto")
+    status_list = st.multiselect(
+        "📌 Status",
+        options=["300 - Pronto para Processamento","200 - Em Análise","100 - Recebido","400 - Processado"],
+        default=["300 - Pronto para Processamento"]
+    )
+    wait_time_main     = st.number_input("⏱️ Tempo extra pós login/troca de tela (s)", min_value=0, value=10)
+    wait_time_download = st.number_input("⏱️ Tempo extra para concluir download (s)", min_value=10, value=18)
+
+# ========= Botão principal =========
+if st.button("🚀 Iniciar Processo (PDF)"):
+
+    MAX_RETRIES = 2
+    tentativa = 0
+
+    while tentativa <= MAX_RETRIES:
+        driver = None
+        try:
+            driver = configurar_driver()
+            wait = WebDriverWait(driver, 40)
+
+            st.write("🔑 Fazendo login...")
+            driver.get("https://portal.amhp.com.br/")
+            wait.until(EC.presence_of_element_located((By.ID, "input-9"))).send_keys(st.secrets["credentials"]["usuario"])
+            driver.find_element(By.ID, "input-12").send_keys(st.secrets["credentials"]["senha"] + Keys.ENTER)
+            time.sleep(wait_time_main)
+
+            st.write("🔄 Acessando TISS...")
+            btn_tiss = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'AMHPTISS')]")))
+            driver.execute_script("arguments[0].click();", btn_tiss)
+            time.sleep(wait_time_main)
+
+            if len(driver.window_handles) > 1:
+                driver.switch_to.window(driver.window_handles[-1])
+
+            st.success("✅ Automação iniciada com sucesso")
+            break
+
+        except Exception as e:
+            tentativa += 1
+            st.warning(f"⚠️ Chrome travou (tentativa {tentativa}/{MAX_RETRIES}). Reiniciando...")
+            try:
+                if driver:
+                    driver.quit()
+            except Exception:
+                pass
+            if tentativa > MAX_RETRIES:
+                st.error(f"❌ Falha definitiva: {e}")
+                break
 
 # ========= PDF → Tabela =========
 def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "text", debug: bool = False) -> pd.DataFrame:
