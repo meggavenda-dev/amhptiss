@@ -77,6 +77,63 @@ def sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
         df[col] = df[col].apply(sanitize_value)
     return df
 
+# ========= Enforce de esquema da Tabela — Atendimentos =========
+TARGET_COLS = [
+    "Atendimento","NrGuia","Realizacao","Hora","TipoGuia",
+    "Operadora","Matricula","Beneficiario","Credenciado",
+    "Prestador","ValorTotal"
+]
+
+def _norm_key(s: str) -> str:
+    if not s: return ""
+    t = s.lower().strip()
+    t = (t.replace("á","a").replace("à","a").replace("â","a").replace("ã","a")
+           .replace("é","e").replace("ê","e")
+           .replace("í","i")
+           .replace("ó","o").replace("ô","o").replace("õ","o")
+           .replace("ú","u")
+           .replace("ç","c"))
+    t = re.sub(r"[^\w]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+SYNONYMS = {
+    "atendimento": "Atendimento",
+    "nr guia": "NrGuia",
+    "nr guia operadora": "NrGuia",
+    "nº guia": "NrGuia",
+    "n  guia": "NrGuia",
+    "realizacao": "Realizacao",
+    "realizacao data": "Realizacao",
+    "realizacao atendimento": "Realizacao",
+    "hora": "Hora",
+    "tipo guia": "TipoGuia",
+    "operadora": "Operadora",
+    "matricula": "Matricula",
+    "beneficiario": "Beneficiario",
+    "nome do beneficiario": "Beneficiario",
+    "credenciado": "Credenciado",
+    "prestador": "Prestador",
+    "valor total": "ValorTotal",
+    "valor": "ValorTotal",
+    "total": "ValorTotal",
+}
+
+def ensure_atendimentos_schema(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=TARGET_COLS)
+    rename_map = {}
+    for c in df.columns:
+        key = _norm_key(str(c))
+        if key in SYNONYMS:
+            rename_map[c] = SYNONYMS[key]
+    df2 = df.rename(columns=rename_map).copy()
+    for col in TARGET_COLS:
+        if col not in df2.columns:
+            df2[col] = ""
+    df2 = df2[TARGET_COLS]
+    return df2
+
 # ========= Selenium =========
 def configurar_driver():
     opts = Options()
@@ -121,20 +178,12 @@ def safe_click(driver, locator, timeout=30):
         driver.execute_script("arguments[0].click();", el)
         return el
 
-# ========= PDF → Tabela por colunas (pdfplumber, multi-page, robusto) =========
+# ========= PDF → Tabela por colunas (pdfplumber, multipage) =========
 def parse_pdf_to_atendimentos_df(pdf_path: str) -> pd.DataFrame:
-    """
-    Extrai a Tabela — Atendimentos por coordenadas:
-    - Localiza o cabeçalho (banda com 'Atendimento ... Valor Total').
-    - Define colunas por caixas (x0/x1) com base nas palavras do cabeçalho.
-    - Agrupa palavras em bandas horizontais e corta por colunas.
-    - Remove a linha 'Total R$ ...'.
-    - Varre TODAS as páginas e concatena.
-    """
     import pdfplumber
 
-    val_re = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}$")  # ex.: 104,38
-    code_start_re = re.compile(r"\d{3,6}-")            # início bloco CODIGO-Nome
+    val_re = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}$")
+    code_start_re = re.compile(r"\d{3,6}-")
     all_records = []
 
     with pdfplumber.open(pdf_path) as pdf:
@@ -143,7 +192,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str) -> pd.DataFrame:
             if not words:
                 continue
 
-            # 1) Localiza banda do cabeçalho
+            # 1) Cabeçalho
             header_y = None
             header_words = []
             for w in words:
@@ -156,7 +205,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str) -> pd.DataFrame:
                         header_words = sorted(band, key=lambda z: z["x0"])
                         break
 
-            # fallback: tenta extract_tables se não encontrou cabeçalho
+            # Fallback simples: extract_tables
             if header_y is None or not header_words:
                 tbls = page.extract_tables()
                 if tbls:
@@ -164,13 +213,13 @@ def parse_pdf_to_atendimentos_df(pdf_path: str) -> pd.DataFrame:
                     if not df.empty:
                         df.columns = df.iloc[0]
                         df = df.iloc[1:].dropna(how="all", axis=1)
-                        # tentativa simples de mapear colunas e acumular
-                        # (mantém como fallback; o grid abaixo é mais confiável)
+                        # mapeia e acumula
+                        df = ensure_atendimentos_schema(df)
                         for _, r in df.iterrows():
-                            all_records.append({k: str(r.get(k, "")).strip() for k in df.columns})
-                continue  # passa para próxima página
+                            all_records.append({k: str(r.get(k, "")).strip() for k in TARGET_COLS})
+                continue
 
-            # 2) Blocos de cabeçalho (junta palavras vizinhas)
+            # 2) Blocos do cabeçalho
             header_sorted = sorted(header_words, key=lambda z: z["x0"])
             if not header_sorted:
                 continue
@@ -215,29 +264,25 @@ def parse_pdf_to_atendimentos_df(pdf_path: str) -> pd.DataFrame:
             if not columns:
                 continue
 
-            # 3) Palavras de dados: abaixo do cabeçalho; corta antes de "Total"
+            # 3) Palavras de dados (abaixo do cabeçalho), corta antes de "Total"
             data_words = [w for w in words if w["top"] > header_y + 2]
             total_candidates = [w for w in data_words if w["text"].lower() == "total"]
             if total_candidates:
                 total_y = total_candidates[0]["top"]
                 data_words = [w for w in data_words if w["top"] < total_y - 2]
 
-            # 4) Bandas horizontais (linhas) com tolerância
+            # 4) Bandas horizontais (linhas)
             rows = []
             band = []
             last_top = None
             for w in sorted(data_words, key=lambda z: (round(z["top"], 1), z["x0"])):
                 if last_top is None or abs(w["top"] - last_top) <= 2.0:
-                    band.append(w)
-                    last_top = w["top"]
+                    band.append(w); last_top = w["top"]
                 else:
-                    rows.append(band)
-                    band = [w]
-                    last_top = w["top"]
-            if band:
-                rows.append(band)
+                    rows.append(band); band = [w]; last_top = w["top"]
+            if band: rows.append(band)
 
-            # 5) Coleta texto por faixa x de cada coluna
+            # 5) Coleta por coluna (x0/x1)
             for row_words in rows:
                 cols_text = {}
                 for col in columns:
@@ -245,11 +290,11 @@ def parse_pdf_to_atendimentos_df(pdf_path: str) -> pd.DataFrame:
                     txt = " ".join([w["text"] for w in sorted(col_words, key=lambda z: z["x0"])])
                     cols_text[col["name"]] = txt.strip()
 
-                # Garante que é banda de dados: precisa ter ValorTotal válido
+                # Banda válida precisa ter ValorTotal
                 if not cols_text.get("ValorTotal") or not val_re.search(cols_text["ValorTotal"]):
                     continue
 
-                # Ajuste fino Credenciado/Prestador por padrão CODIGO-Nome, se vierem vazios
+                # Ajuste Credenciado/Prestador por padrão CODIGO-Nome (se vazio)
                 tail = " ".join([
                     cols_text.get("Beneficiario",""),
                     cols_text.get("Credenciado",""),
@@ -284,6 +329,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str) -> pd.DataFrame:
             out = out.sort_values(["Realizacao_dt","Hora"]).drop(columns=["Realizacao_dt"])
         except Exception:
             pass
+    out = ensure_atendimentos_schema(out)
     return sanitize_df(out)
 
 # ========= UI =========
@@ -403,9 +449,15 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                         df_pdf["Periodo_Inicio"]    = sanitize_value(data_ini)
                         df_pdf["Periodo_Fim"]       = sanitize_value(data_fim)
 
-                        # Preview
-                        cols_show = ["Atendimento","NrGuia","Realizacao","Hora","TipoGuia","Operadora","Matricula","Beneficiario","Credenciado","Prestador","ValorTotal"]
-                        st.dataframe(df_pdf[cols_show], use_container_width=True)
+                        # Guard das colunas
+                        cols_show = TARGET_COLS
+                        missing = [c for c in cols_show if c not in df_pdf.columns]
+                        if missing:
+                            st.warning(f"As colunas {missing} não estavam presentes; exibindo todas as colunas retornadas para inspeção.")
+                            st.write("Colunas retornadas:", list(df_pdf.columns))
+                            st.dataframe(df_pdf, use_container_width=True)
+                        else:
+                            st.dataframe(df_pdf[cols_show], use_container_width=True)
 
                         # Consolida
                         st.session_state.db_consolidado = pd.concat([st.session_state.db_consolidado, df_pdf], ignore_index=True)
