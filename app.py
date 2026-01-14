@@ -17,7 +17,6 @@ def iniciar_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    
     service = Service("/usr/bin/chromedriver")
     try:
         return webdriver.Chrome(service=service, options=options)
@@ -26,103 +25,89 @@ def iniciar_driver():
 
 st.title("🏥 Gerador de Relatórios AMHP")
 
-# --- ENTRADA DE DADOS DO USUÁRIO ---
 col1, col2 = st.columns(2)
 with col1:
-    data_inicio = st.text_input("📅 Data Inicial", placeholder="DD/MM/AAAA")
+    data_inicio = st.text_input("📅 Data Inicial", value="01/01/2024")
 with col2:
-    data_fim = st.text_input("📅 Data Final", placeholder="DD/MM/AAAA")
-
-USUARIO = st.secrets["credentials"]["usuario"]
-SENHA = st.secrets["credentials"]["senha"]
+    data_fim = st.text_input("📅 Data Final", value="31/01/2024")
 
 if st.button("🚀 Gerar Relatório"):
-    if not data_inicio or not data_fim:
-        st.error("Por favor, informe as datas inicial e final.")
-    else:
-        driver = iniciar_driver()
-        if driver:
-            try:
-                with st.status("Executando automação...", expanded=True) as status:
-                    
-                    # 1. LOGIN E NAVEGAÇÃO (Mantendo o que já funciona)
-                    st.write("🔐 Autenticando...")
-                    driver.get("https://portal.amhp.com.br/")
-                    wait = WebDriverWait(driver, 30)
-                    wait.until(EC.presence_of_element_located((By.ID, "input-9"))).send_keys(USUARIO)
-                    driver.find_element(By.ID, "input-12").send_keys(SENHA + Keys.ENTER)
-                    time.sleep(12) 
-                    
-                    st.write("🖱️ Acessando AMHPTISS...")
-                    botao_tiss = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'AMHPTISS')]")))
-                    driver.execute_script("arguments[0].click();", botao_tiss)
-                    time.sleep(8)
-                    if len(driver.window_handles) > 1:
-                        driver.switch_to.window(driver.window_handles[1])
+    driver = iniciar_driver()
+    if driver:
+        try:
+            with st.status("Executando...", expanded=True) as status:
+                wait = WebDriverWait(driver, 40) # Aumentamos o tempo de espera geral
+                
+                # --- LOGIN E NAVEGAÇÃO ---
+                st.write("🔐 Acessando e Logando...")
+                driver.get("https://portal.amhp.com.br/")
+                wait.until(EC.presence_of_element_located((By.ID, "input-9"))).send_keys(st.secrets["credentials"]["usuario"])
+                driver.find_element(By.ID, "input-12").send_keys(st.secrets["credentials"]["senha"] + Keys.ENTER)
+                time.sleep(10) 
+                
+                driver.execute_script("arguments[0].click();", wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'AMHPTISS')]"))))
+                time.sleep(8)
+                if len(driver.window_handles) > 1: driver.switch_to.window(driver.window_handles[1])
 
-                    # Fechar informativo
-                    try:
-                        btn_fechar = WebDriverWait(driver, 7).until(EC.element_to_be_clickable((By.ID, "fechar-informativo")))
-                        driver.execute_script("arguments[0].click();", btn_fechar)
-                    except: pass
+                try: # Fechar informativo
+                    driver.execute_script("arguments[0].click();", wait.until(EC.element_to_be_clickable((By.ID, "fechar-informativo"))))
+                except: pass
 
-                    # 2. NAVEGAÇÃO ATÉ A TELA
-                    st.write("📂 Navegando para Atendimentos Realizados...")
-                    wait.until(EC.element_to_be_clickable((By.ID, "IrPara"))).click()
-                    time.sleep(1)
-                    wait.until(EC.element_to_be_clickable((By.XPATH, "//span[@class='rtIn' and contains(text(), 'Consultório')]"))).click()
-                    time.sleep(1)
-                    wait.until(EC.element_to_be_clickable((By.XPATH, "//a[@href='AtendimentosRealizados.aspx']"))).click()
-                    time.sleep(5)
+                # --- NAVEGAÇÃO ATÉ A TELA ---
+                st.write("📂 Abrindo Atendimentos Realizados...")
+                wait.until(EC.element_to_be_clickable((By.ID, "IrPara"))).click()
+                wait.until(EC.element_to_be_clickable((By.XPATH, "//span[@class='rtIn' and contains(text(), 'Consultório')]"))).click()
+                wait.until(EC.element_to_be_clickable((By.XPATH, "//a[@href='AtendimentosRealizados.aspx']"))).click()
+                
+                # --- PREENCHIMENTO DOS FILTROS ---
+                st.write("📝 Configurando filtros...")
+                
+                # Negociação
+                neg = wait.until(EC.element_to_be_clickable((By.ID, "ctl00_MainContent_rcbTipoNegociacao_Input")))
+                neg.clear()
+                neg.send_keys("Direto" + Keys.ENTER)
+                time.sleep(1)
 
-                    # 3. PREENCHIMENTO DOS FILTROS (Lógica Telerik)
-                    st.write("📝 Preenchendo filtros do relatório...")
+                # Status
+                stat = wait.until(EC.element_to_be_clickable((By.ID, "ctl00_MainContent_rcbStatus_Input")))
+                stat.clear()
+                stat.send_keys("300 - Pronto para Processamento" + Keys.ENTER)
+                time.sleep(1)
 
-                    # Filtro Negociação: Direto
-                    negocio = wait.until(EC.element_to_be_clickable((By.ID, "ctl00_MainContent_rcbTipoNegociacao_Input")))
-                    negocio.clear()
-                    negocio.send_keys("Direto")
-                    time.sleep(1)
-                    negocio.send_keys(Keys.ENTER)
+                # Datas
+                driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataInicio_dateInput").send_keys(data_inicio)
+                driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataFim_dateInput").send_keys(data_fim)
 
-                    # Filtro Status: 300 - Pronto para Processamento
-                    status_campo = wait.until(EC.element_to_be_clickable((By.ID, "ctl00_MainContent_rcbStatus_Input")))
-                    status_campo.clear()
-                    status_campo.send_keys("300 - Pronto para Processamento")
-                    time.sleep(1)
-                    status_campo.send_keys(Keys.ENTER)
+                # --- BOTÃO BUSCAR E ESPERA INTELIGENTE ---
+                st.write("🔍 Gerando relatório... Por favor, aguarde.")
+                btn_buscar = driver.find_element(By.ID, "ctl00_MainContent_btnBuscar_input")
+                driver.execute_script("arguments[0].click();", btn_buscar)
 
-                    # Data Início
-                    st.write(f"📅 Definindo período: {data_inicio} até {data_fim}")
-                    dt_ini = driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataInicio_dateInput")
-                    dt_ini.clear()
-                    dt_ini.send_keys(data_inicio)
+                # ESPERA DINÂMICA:
+                # 1. Esperamos um breve momento para o 'loading' aparecer
+                time.sleep(3)
+                
+                # 2. Esperamos até que o indicador de carregamento (se houver) suma 
+                # OU até que a tabela de resultados (Grid) seja atualizada/visível.
+                # Geralmente o Telerik usa IDs que contêm 'Grid' ou 'RadGrid'
+                try:
+                    st.write("⏳ O sistema está processando os dados...")
+                    # Espera até 60 segundos por algum elemento que indique que a tabela carregou
+                    # Aqui usamos um seletor genérico para tabelas de resultados
+                    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".rgMasterTable, #ctl00_MainContent_gvAtendimentos")))
+                    st.write("✅ Dados carregados com sucesso!")
+                except:
+                    st.write("⚠️ O tempo de espera excedeu, tentando capturar o que estiver na tela...")
 
-                    # Data Fim
-                    dt_fim = driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataFim_dateInput")
-                    dt_fim.clear()
-                    dt_fim.send_keys(data_fim)
-                    time.sleep(1)
+                # Finalização
+                driver.save_screenshot("relatorio_gerado.png")
+                st.image("relatorio_gerado.png", caption=f"Relatório Gerado: {data_inicio} a {data_fim}")
+                st.success("Processo concluído!")
+                status.update(label="Relatório Pronto!", state="complete", expanded=False)
 
-                    # 4. BOTÃO BUSCAR
-                    st.write("🔍 Clicando em Buscar...")
-                    btn_buscar = driver.find_element(By.ID, "ctl00_MainContent_btnBuscar_input")
-                    driver.execute_script("arguments[0].click();", btn_buscar)
-                    
-                    # Espera a busca processar
-                    st.write("⏳ Processando busca...")
-                    time.sleep(8)
-
-                    # 5. VERIFICAÇÃO
-                    driver.save_screenshot("resultado_busca.png")
-                    st.image("resultado_busca.png", caption="Resultado da Busca")
-                    st.success("Busca finalizada! Verifique na imagem se os dados apareceram.")
-
-                    status.update(label="Busca concluída!", state="complete", expanded=False)
-
-            except Exception as e:
-                st.error(f"🚨 Erro: {e}")
-                driver.save_screenshot("erro_filtro.png")
-                st.image("erro_filtro.png")
-            finally:
-                driver.quit()
+        except Exception as e:
+            st.error(f"🚨 Erro: {e}")
+            driver.save_screenshot("erro_relatorio.png")
+            st.image("erro_relatorio.png")
+        finally:
+            driver.quit()
