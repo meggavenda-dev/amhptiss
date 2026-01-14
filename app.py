@@ -92,27 +92,3 @@ if st.button("Iniciar Processamento"):
     
     finally:
         driver.quit()
-
----
-
-### Relembrando os arquivos auxiliares:
-
-Para que o código acima rode no **GitHub / Streamlit Cloud**, você **DEVE** ter esses dois arquivos no mesmo repositório:
-
-1.  **`requirements.txt`**:
-    ```text
-    streamlit
-    selenium
-    webdriver-manager
-    ```
-2.  **`packages.txt`**:
-    ```text
-    chromium-chromedriver
-    ```
-
-### Como testar agora:
-1. Suba os arquivos para o GitHub.
-2. No Streamlit Cloud, configure os **Secrets** com o `usuario` e `senha`.
-3. Clique no botão e veja se ele consegue chegar à página `Default.aspx`.
-
-**O próximo passo agora é o relatório: quando você está no `Default.aspx`, em qual menu você clica? Me descreva o caminho ou mande o código do botão de relatório para continuarmos.**
