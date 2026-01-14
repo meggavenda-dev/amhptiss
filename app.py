@@ -10,7 +10,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
-from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException
+from selenium.common.exceptions import TimeoutException
 
 # ========= Secrets/env =========
 try:
@@ -121,22 +121,14 @@ def configurar_driver():
     driver.set_script_timeout(180)
     return driver
 
-# ⚡ CORREÇÃO: clique seguro com retry + scroll
-def js_safe_click(driver, by, value, timeout=30, retries=3):
-    for attempt in range(retries):
-        try:
-            el = WebDriverWait(driver, timeout).until(
-                EC.presence_of_element_located((by, value))
-            )
-            driver.execute_script("arguments[0].scrollIntoView(true);", el)
-            driver.execute_script("arguments[0].click();", el)
-            return
-        except (TimeoutException, ElementClickInterceptedException):
-            time.sleep(1)
-            if attempt == retries - 1:
-                raise
+def js_safe_click(driver, by, value, timeout=30):
+    el = WebDriverWait(driver, timeout).until(
+        EC.presence_of_element_located((by, value))
+    )
+    driver.execute_script("arguments[0].click();", el)
+    time.sleep(0.5)  # pequeno delay para garantir o click
 
-# ========= Parser PDF (textual fallback) =========
+# ========= Parser PDF =========
 def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "text", debug: bool = False) -> pd.DataFrame:
     from PyPDF2 import PdfReader
 
@@ -228,25 +220,11 @@ with st.sidebar:
     )
     wait_time_main     = st.number_input("⏱️ Tempo extra pós login/troca de tela (s)", min_value=0, value=10)
     wait_time_download = st.number_input("⏱️ Tempo extra para concluir download (s)", min_value=10, value=18)
-    extraction_mode    = st.selectbox("🧠 Modo de extração do PDF (visual)", ["Coordenadas (recomendado)", "Texto (fallback)"])
     debug_parser       = st.checkbox("🧪 Debug do parser PDF", value=False)
-
-# ========= PDF Manual =========
-with st.expander("🧪 Testar parser com upload de PDF (sem automação)", expanded=False):
-    up = st.file_uploader("Envie um PDF do AMHPTISS para teste", type=["pdf"])
-    if up and st.button("Processar PDF (teste)"):
-        tmp_pdf = os.path.join(DOWNLOAD_TEMPORARIO, "teste_upload.pdf")
-        with open(tmp_pdf, "wb") as f:
-            f.write(up.getvalue())
-        df_test = parse_pdf_to_atendimentos_df(tmp_pdf, mode="text", debug=debug_parser)
-        if df_test.empty:
-            st.error("Parser não conseguiu extrair linhas deste PDF usando o modo textual.")
-        else:
-            st.success(f"{len(df_test)} linha(s) extraída(s) pelo modo textual.")
-            st.dataframe(df_test, use_container_width=True)
 
 # ========= Botão principal =========
 if st.button("🚀 Iniciar Processo (PDF)"):
+
     driver = configurar_driver()
     try:
         with st.status("Executando automação...", expanded=True) as status:
@@ -292,32 +270,56 @@ if st.button("🚀 Iniciar Processo (PDF)"):
             js_safe_click(driver, By.XPATH, "//a[@href='AtendimentosRealizados.aspx']")
             time.sleep(3)
 
+            # ====== NOVO: Seleção do credenciado (teste com 14406) ======
+            credenciado_codigo = "14406"
+            input_cred = WebDriverWait(driver, wait_time_main).until(
+                EC.presence_of_element_located((By.ID, "ctl00_MainContent_rcbCredenciado_Input"))
+            )
+            input_cred.clear()
+            input_cred.send_keys(credenciado_codigo)
+            time.sleep(0.5)
+            lista = WebDriverWait(driver, wait_time_main).until(
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "li.rcbHovered, li.rcbFocused, li.rcbItem"))
+            )
+            item_correspondente = None
+            for li in lista:
+                if credenciado_codigo in li.text:
+                    item_correspondente = li
+                    break
+            if item_correspondente:
+                driver.execute_script("arguments[0].click();", item_correspondente)
+                time.sleep(0.5)
+            else:
+                st.warning(f"Credenciado {credenciado_codigo} não encontrado")
+
             # 5) Loop de Status
             for status_sel in status_list:
                 st.write(f"📝 Filtros → Negociação: **{negociacao}**, Status: **{status_sel}**, Período: **{data_ini}–{data_fim}**")
 
+                # Negociação/Status/Datas
                 neg_input  = wait.until(EC.presence_of_element_located((By.ID, "ctl00_MainContent_rcbTipoNegociacao_Input")))
                 stat_input = wait.until(EC.presence_of_element_located((By.ID, "ctl00_MainContent_rcbStatus_Input")))
                 driver.execute_script("arguments[0].value = arguments[1];", neg_input, negociacao); neg_input.send_keys(Keys.ENTER)
-                driver.execute_script("arguments[0].value = arguments[1];", stat_input, status_sel); stat_input.send_keys(Keys.ENTER)
+                driver.execute_script("arguments[0].value = arguments[1];", stat_input, status_sel);  stat_input.send_keys(Keys.ENTER)
                 d_ini_el = driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataInicio_dateInput"); d_ini_el.clear(); d_ini_el.send_keys(data_ini + Keys.TAB)
-                d_fim_el = driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataFim_dateInput"); d_fim_el.clear(); d_fim_el.send_keys(data_fim + Keys.TAB)
+                d_fim_el = driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataFim_dateInput");     d_fim_el.clear(); d_fim_el.send_keys(data_fim + Keys.TAB)
 
                 # Buscar
                 btn_buscar = driver.find_element(By.ID, "ctl00_MainContent_btnBuscar_input")
                 driver.execute_script("arguments[0].click();", btn_buscar)
                 wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".rgMasterTable")))
 
-                # Seleciona e imprime
-                js_safe_click(driver, By.ID, "ctl00_MainContent_rdgAtendimentosRealizados_ctl00_ctl02_ctl00_SelectColumnSelectCheckBox")
+                # Seleciona e imprime (ReportViewer)
+                driver.execute_script("document.getElementById('ctl00_MainContent_rdgAtendimentosRealizados_ctl00_ctl02_ctl00_SelectColumnSelectCheckBox').click();")
                 time.sleep(2)
-                js_safe_click(driver, By.ID, "ctl00_MainContent_rbtImprimirAtendimentos_input")
+                driver.execute_script("document.getElementById('ctl00_MainContent_rbtImprimirAtendimentos_input').click();")
                 time.sleep(wait_time_main)
 
-                # Iframe
+                # Iframe do ReportViewer
                 if len(driver.find_elements(By.TAG_NAME, "iframe")) > 0:
                     driver.switch_to.frame(0)
 
+                # Exportar sempre em PDF
                 dropdown = wait.until(EC.presence_of_element_located((By.ID, "ReportView_ReportToolbar_ExportGr_FormatList_DropDownList")))
                 Select(dropdown).select_by_value("PDF")
                 time.sleep(2)
@@ -327,6 +329,7 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                 st.write("📥 Concluindo download do PDF...")
                 time.sleep(wait_time_download)
 
+                # Processa PDF
                 arquivos = [
                     os.path.join(DOWNLOAD_TEMPORARIO, f)
                     for f in os.listdir(DOWNLOAD_TEMPORARIO)
@@ -342,14 +345,26 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                     shutil.move(recente, destino_pdf)
                     st.success(f"✅ PDF salvo: {destino_pdf}")
 
+                    st.write("📄 Extraindo Tabela — Atendimentos do PDF...")
                     df_pdf = parse_pdf_to_atendimentos_df(destino_pdf, mode="text", debug=debug_parser)
+
                     if not df_pdf.empty:
                         df_pdf["Filtro_Negociacao"] = sanitize_value(negociacao)
                         df_pdf["Filtro_Status"]     = sanitize_value(status_sel)
                         df_pdf["Periodo_Inicio"]    = sanitize_value(data_ini)
                         df_pdf["Periodo_Fim"]       = sanitize_value(data_fim)
+
+                        cols_show = TARGET_COLS
+                        missing = [c for c in cols_show if c not in df_pdf.columns]
+                        if missing:
+                            st.warning(f"As colunas {missing} não estavam presentes; exibindo todas as colunas retornadas para inspeção.")
+                            st.write("Colunas retornadas:", list(df_pdf.columns))
+                            st.dataframe(df_pdf, use_container_width=True)
+                        else:
+                            st.dataframe(df_pdf[cols_show], use_container_width=True)
+
                         st.session_state.db_consolidado = pd.concat([st.session_state.db_consolidado, df_pdf], ignore_index=True)
-                        st.dataframe(df_pdf, use_container_width=True)
+                        st.write(f"📊 Registros acumulados: {len(st.session_state.db_consolidado)}")
                     else:
                         st.warning("⚠️ Modo textual não conseguiu extrair linhas.")
 
@@ -388,6 +403,9 @@ if not st.session_state.db_consolidado.empty:
     st.dataframe(df_preview, use_container_width=True)
 
     csv_bytes = df_preview.to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button("💾 Baixar Consolidação (CSV)", csv_bytes,    file_name="consolidado_amhp.csv",
+    st.download_button(
+        "💾 Baixar Consolidação (CSV)",
+        csv_bytes,
+        file_name="consolidado_amhptiss.csv",
         mime="text/csv"
     )
