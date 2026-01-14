@@ -147,9 +147,13 @@ def _normalize_ws2(s: str) -> str:
 # ---------- PRÉ-LIMPEZA ROBUSTA DO TEXTO ----------
 def _preclean_report_text(raw: str) -> str:
     """
-    - Corta preâmbulo (filtros) até o cabeçalho da tabela.
-    - Insere espaço entre Data e Hora quando coladas.
-    - Insere espaço entre Hora e Tipo de Guia quando coladas.
+    - Corta preâmbulo (filtros) e pula o cabeçalho (começa após 'Valor Total').
+    - Insere espaços entre tokens colados:
+      • dois blocos numéricos longos (Atendimento e NrGuia),
+      • Data↔Hora,
+      • Hora↔TipoGuia,
+      • TipoGuia↔Operadora (p.ex. 'SP/SADTBACEN(104)'),
+      • ')'↔Matrícula.
     - Normaliza whitespace.
     """
     if not raw:
@@ -157,19 +161,31 @@ def _preclean_report_text(raw: str) -> str:
     txt = raw.replace("\u00A0", " ")
     txt = _ILLEGAL_CTRL_RE.sub("", txt)
 
-    # Corta antes do cabeçalho da grade
-    m = re.search(r"(Atendimento\s*Nr\.?\s*Guia.*?Valor\s*Total)", txt, flags=re.I|re.S)
-    if m:
-        txt = txt[m.start():]
-    else:
-        m2 = re.search(r"\d{2}/\d{2}/\d{4}\s*\d{2}:\d{2}\s*(Consulta|SP/SADT|Honorário|Não)", txt, flags=re.I)
-        if m2:
-            txt = txt[max(0, m2.start()-30):]
+    # Inserir espaço entre dois blocos numéricos longos colados
+    txt = re.sub(r"(\d{6,})(\d{6,})", r"\1 \2", txt)
 
     # Espaço entre Data e Hora coladas
     txt = re.sub(r"(\d{2}/\d{2}/\d{4})(\d{2}:\d{2})", r"\1 \2", txt)
-    # Espaço entre Hora e TipoGuia colados
+
+    # Espaço entre Hora e próximo token alfabético (Tipo de Guia)
     txt = re.sub(r"(\d{2}:\d{2})(?=[A-Za-zÁ-Úá-úNÇS/])", r"\1 ", txt)
+
+    # Espaço entre Tipo de Guia e Operadora coladas (ex.: 'SP/SADTBACEN(' -> 'SP/SADT BACEN(' ; 'ConsultaAFFEGO(' -> 'Consulta AFFEGO(')
+    txt = re.sub(r"([A-Za-zÁ-Úá-ú/])([A-Z]{2,}\()", r"\1 \2", txt)
+
+    # Espaço entre ')' e matrícula coladas
+    txt = re.sub(r"(\))(\d{5,})", r"\1 \2", txt)
+
+    # Corta antes/até o cabeçalho e começa APÓS 'Valor Total'
+    m = re.search(r"(Atendimento\s*Nr\.?\s*Guia.*?Valor\s*Total)", txt, flags=re.I|re.S)
+    if m:
+        txt = txt[m.end():]  # começa logo depois do cabeçalho
+    else:
+        # fallback: primeira ocorrência de dois números + data + hora
+        m2 = re.search(r"\d{6,}\s+\d{6,}\s+\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}", txt)
+        if m2:
+            txt = txt[m2.start():]
+
     # Normaliza
     txt = _normalize_ws2(txt)
     return txt
