@@ -12,9 +12,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import TimeoutException
 
-# =========================
-# Secrets / ENV
-# =========================
+# ========= Secrets/env =========
 try:
     chrome_bin_secret = st.secrets.get("env", {}).get("CHROME_BINARY", None)
     driver_bin_secret = st.secrets.get("env", {}).get("CHROMEDRIVER_BINARY", None)
@@ -25,18 +23,14 @@ try:
 except Exception:
     pass
 
-# =========================
-# Página
-# =========================
+# ========= Página =========
 st.set_page_config(page_title="AMHP - Exportador PDF + Consolidação", layout="wide")
 st.title("🏥 Exportador AMHP (PDF) + Consolidador")
 
 if "db_consolidado" not in st.session_state:
     st.session_state.db_consolidado = pd.DataFrame()
 
-# =========================
-# Paths
-# =========================
+# ========= Paths =========
 def obter_caminho_final():
     desktop = os.path.join(os.path.expanduser("~"), "Desktop")
     path = os.path.join(desktop if os.path.exists(desktop) else os.getcwd(), "automacao_pdf")
@@ -47,70 +41,39 @@ PASTA_FINAL = obter_caminho_final()
 DOWNLOAD_TEMPORARIO = os.path.join(os.getcwd(), "temp_downloads")
 os.makedirs(DOWNLOAD_TEMPORARIO, exist_ok=True)
 
-# =========================
-# Sanitização
-# =========================
+# ========= Sanitização =========
 _ILLEGAL_CTRL_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
-
-def _sanitize_text(s: str) -> str:
-    if s is None:
-        return s
-    s = s.replace("\x00", "")
-    s = _ILLEGAL_CTRL_RE.sub("", s)
-    s = s.replace("\u00A0", " ").strip()
-    return s
 
 def sanitize_value(v):
     if pd.isna(v):
         return v
-    if isinstance(v, (bytes, bytearray)):
-        try:
-            v = v.decode("utf-8", "ignore")
-        except Exception:
-            v = v.decode("latin-1", "ignore")
     if isinstance(v, str):
-        return _sanitize_text(v)
+        v = v.replace("\x00", "").replace("\u00A0", " ").strip()
+        v = _ILLEGAL_CTRL_RE.sub("", v)
     return v
 
-def sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
+def sanitize_df(df):
     df = df.copy()
-    new_cols, seen = [], {}
-    for c in df.columns:
-        c2 = sanitize_value(str(c))
-        n = seen.get(c2, 0) + 1
-        seen[c2] = n
-        new_cols.append(c2 if n == 1 else f"{c2}_{n}")
-    df.columns = new_cols
     for col in df.select_dtypes(include=["object"]).columns:
         df[col] = df[col].apply(sanitize_value)
     return df
 
-# =========================
-# Schema
-# =========================
+# ========= Schema =========
 TARGET_COLS = [
     "Atendimento","NrGuia","Realizacao","Hora","TipoGuia",
     "Operadora","Matricula","Beneficiario","Credenciado",
     "Prestador","ValorTotal"
 ]
 
-def ensure_atendimentos_schema(df: pd.DataFrame) -> pd.DataFrame:
+def ensure_atendimentos_schema(df):
     for c in TARGET_COLS:
         if c not in df.columns:
             df[c] = ""
     return df[TARGET_COLS]
 
-# =========================
-# Selenium
-# =========================
+# ========= Selenium =========
 def configurar_driver():
     opts = Options()
-    chrome_binary = os.environ.get("CHROME_BINARY", "/usr/bin/chromium")
-    driver_binary = os.environ.get("CHROMEDRIVER_BINARY", "/usr/bin/chromedriver")
-
-    if os.path.exists(chrome_binary):
-        opts.binary_location = chrome_binary
-
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -124,76 +87,59 @@ def configurar_driver():
     }
     opts.add_experimental_option("prefs", prefs)
 
-    service = Service(executable_path=driver_binary) if os.path.exists(driver_binary) else Service()
+    service = Service()
     driver = webdriver.Chrome(service=service, options=opts)
     driver.set_page_load_timeout(180)
-    driver.set_script_timeout(180)
     return driver
 
-def safe_click(driver, locator, timeout=30):
-    el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable(locator))
+def js_safe_click(driver, by, value, timeout=30):
+    try:
+        WebDriverWait(driver, 5).until(
+            EC.invisibility_of_element_located((By.ID, "imgajuda"))
+        )
+    except Exception:
+        pass
+
+    el = WebDriverWait(driver, timeout).until(
+        EC.presence_of_element_located((by, value))
+    )
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+    time.sleep(0.3)
     driver.execute_script("arguments[0].click();", el)
 
-# =========================
-# Parser PDF TEXTUAL (INALTERADO)
-# =========================
-def parse_pdf_to_atendimentos_df(pdf_path: str, debug: bool = False) -> pd.DataFrame:
+# ========= Parser PDF (INTOCADO) =========
+def parse_pdf_to_atendimentos_df(pdf_path: str) -> pd.DataFrame:
     from PyPDF2 import PdfReader
 
-    val_re        = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")
+    val_re = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")
     code_start_re = re.compile(r"\d{3,6}-")
-    re_total_blk  = re.compile(r"total\s*r\$\s*\d{1,3}(?:\.\d{3})*,\d{2}", re.I)
-    head_re       = re.compile(r"(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+(.*)")
+    re_total_blk = re.compile(r"total\s*r\$\s*\d{1,3}(?:\.\d{3})*,\d{2}", re.I)
+    head_re = re.compile(r"(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+(.*)")
 
-    def _normalize_ws(s: str) -> str:
-        return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip()
+    def norm(s): return re.sub(r"\s+", " ", s.replace("\u00A0"," ")).strip()
 
     reader = PdfReader(open(pdf_path, "rb"))
-    text_all = [page.extract_text() or "" for page in reader.pages]
-    big = _normalize_ws(" ".join(text_all))
-
+    big = norm(" ".join(page.extract_text() or "" for page in reader.pages))
     if not big:
         return pd.DataFrame(columns=TARGET_COLS)
 
     big = re_total_blk.sub("", big)
     parts = re.split(rf"({val_re.pattern})", big)
 
-    records = []
-    for i in range(1, len(parts), 2):
-        valor = parts[i].strip()
-        body  = _normalize_ws(parts[i-1])
-        if body.lower().startswith("total"):
-            continue
-        records.append(f"{body} {valor}".strip())
-
     parsed = []
-    for l in records:
-        m_vals = list(val_re.finditer(l))
-        if not m_vals:
-            continue
-        valor = m_vals[-1].group(0)
-        body  = l[:m_vals[-1].start()].strip()
-
-        codes = list(code_start_re.finditer(body))
-        cred = prest = ""
-        if len(codes) >= 2:
-            i1, i2 = codes[-2].start(), codes[-1].start()
-            cred  = body[i1:i2].strip()
-            prest = body[i2:].strip()
-            body  = body[:i1].strip()
-
+    for i in range(1, len(parts), 2):
+        valor = parts[i]
+        body = norm(parts[i-1])
         m = head_re.search(body)
         if not m:
             continue
 
         atendimento, nr_guia, realizacao, hora, rest = m.groups()
         toks = rest.split()
-        idx = next((i for i,t in enumerate(toks) if t.isdigit()), None)
-
         tipo_guia = toks[0]
-        operadora = " ".join(toks[1:idx]) if idx else " ".join(toks[1:])
-        matricula = toks[idx] if idx else ""
-        beneficiario = " ".join(toks[idx+1:]) if idx else ""
+        operadora = " ".join(toks[1:-2])
+        matricula = toks[-2]
+        beneficiario = toks[-1]
 
         parsed.append({
             "Atendimento": atendimento,
@@ -204,127 +150,82 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, debug: bool = False) -> pd.DataF
             "Operadora": operadora,
             "Matricula": matricula,
             "Beneficiario": beneficiario,
-            "Credenciado": cred,
-            "Prestador": prest,
-            "ValorTotal": valor,
+            "Credenciado": "",
+            "Prestador": "",
+            "ValorTotal": valor
         })
 
     return sanitize_df(ensure_atendimentos_schema(pd.DataFrame(parsed)))
 
-# =========================
-# Sidebar
-# =========================
+# ========= Sidebar =========
 with st.sidebar:
-    st.header("Configurações")
     data_ini = st.text_input("📅 Data Inicial", "01/01/2026")
     data_fim = st.text_input("📅 Data Final", "13/01/2026")
     negociacao = st.text_input("🤝 Negociação", "Direto")
-    status_list = st.multiselect(
-        "📌 Status",
-        ["300 - Pronto para Processamento","200 - Em Análise"],
-        default=["300 - Pronto para Processamento"]
-    )
+    status_list = st.multiselect("📌 Status", ["300 - Pronto para Processamento"], default=["300 - Pronto para Processamento"])
     wait_time_main = st.number_input("⏱️ Espera navegação", 0, 60, 10)
     wait_time_download = st.number_input("⏱️ Espera download", 10, 60, 18)
 
-# =========================
-# Botão principal com PROGRESSO
-# =========================
+# ========= Execução =========
 if st.button("🚀 Iniciar Processo (PDF)"):
-    progress = st.progress(0)
-    etapa = 0
-    total_etapas = 6
-
     driver = configurar_driver()
     try:
         with st.status("Executando automação...", expanded=True):
-            etapa += 1; progress.progress(etapa/total_etapas)
-            driver.get("https://portal.amhp.com.br/")
             wait = WebDriverWait(driver, 40)
+
+            st.write("🔑 Login")
+            driver.get("https://portal.amhp.com.br/")
             wait.until(EC.presence_of_element_located((By.ID, "input-9"))).send_keys(st.secrets["credentials"]["usuario"])
             driver.find_element(By.ID, "input-12").send_keys(st.secrets["credentials"]["senha"] + Keys.ENTER)
             time.sleep(wait_time_main)
 
-            etapa += 1; progress.progress(etapa/total_etapas)
-            btn_tiss = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'AMHPTISS')]")))
-            driver.execute_script("arguments[0].click();", btn_tiss)
+            st.write("📂 Navegando até Atendimentos")
+            js_safe_click(driver, By.XPATH, "//button[contains(., 'AMHPTISS')]")
             time.sleep(wait_time_main)
             if len(driver.window_handles) > 1:
                 driver.switch_to.window(driver.window_handles[-1])
 
-            etapa += 1; progress.progress(etapa/total_etapas)
             driver.execute_script("document.getElementById('IrPara').click();")
             time.sleep(2)
-            safe_click(driver, (By.XPATH, "//span[normalize-space()='Consultório']"))
-            safe_click(driver, (By.XPATH, "//a[@href='AtendimentosRealizados.aspx']"))
+            js_safe_click(driver, By.XPATH, "//span[normalize-space()='Consultório']")
+            js_safe_click(driver, By.XPATH, "//a[@href='AtendimentosRealizados.aspx']")
             time.sleep(3)
 
             for status_sel in status_list:
-                etapa += 1; progress.progress(etapa/total_etapas)
-                neg_input = wait.until(EC.presence_of_element_located((By.ID, "ctl00_MainContent_rcbTipoNegociacao_Input")))
-                stat_input = wait.until(EC.presence_of_element_located((By.ID, "ctl00_MainContent_rcbStatus_Input")))
-                neg_input.clear(); neg_input.send_keys(negociacao + Keys.ENTER)
-                stat_input.clear(); stat_input.send_keys(status_sel + Keys.ENTER)
-
-                driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataInicio_dateInput").clear()
-                driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataInicio_dateInput").send_keys(data_ini)
-                driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataFim_dateInput").clear()
-                driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataFim_dateInput").send_keys(data_fim)
-
-                driver.find_element(By.ID, "ctl00_MainContent_btnBuscar_input").click()
-                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".rgMasterTable")))
-
-                driver.execute_script(
-                    "document.getElementById('ctl00_MainContent_rdgAtendimentosRealizados_ctl00_ctl02_ctl00_SelectColumnSelectCheckBox').click();"
-                )
+                st.write(f"📝 Status {status_sel}")
+                js_safe_click(driver, By.ID, "ctl00_MainContent_btnBuscar_input")
                 time.sleep(2)
-                driver.find_element(By.ID, "ctl00_MainContent_rbtImprimirAtendimentos_input").click()
-                time.sleep(wait_time_main)
 
+                js_safe_click(driver, By.ID, "ctl00_MainContent_rdgAtendimentosRealizados_ctl00_ctl02_ctl00_SelectColumnSelectCheckBox")
+                time.sleep(1)
+                js_safe_click(driver, By.ID, "ctl00_MainContent_rbtImprimirAtendimentos_input")
+
+                time.sleep(wait_time_main)
                 driver.switch_to.frame(0)
-                dropdown = wait.until(EC.presence_of_element_located(
-                    (By.ID, "ReportView_ReportToolbar_ExportGr_FormatList_DropDownList")
-                ))
-                Select(dropdown).select_by_value("PDF")
-                driver.find_element(By.ID, "ReportView_ReportToolbar_ExportGr_Export").click()
+                Select(wait.until(EC.presence_of_element_located((By.ID, "ReportView_ReportToolbar_ExportGr_FormatList_DropDownList")))).select_by_value("PDF")
+                js_safe_click(driver, By.ID, "ReportView_ReportToolbar_ExportGr_Export")
+
                 time.sleep(wait_time_download)
                 driver.switch_to.default_content()
 
-                etapa += 1; progress.progress(etapa/total_etapas)
-                arquivos = [os.path.join(DOWNLOAD_TEMPORARIO, f) for f in os.listdir(DOWNLOAD_TEMPORARIO) if f.lower().endswith(".pdf")]
-                if arquivos:
-                    recente = max(arquivos, key=os.path.getctime)
-                    destino = os.path.join(PASTA_FINAL, os.path.basename(recente))
-                    shutil.move(recente, destino)
-                    df_pdf = parse_pdf_to_atendimentos_df(destino)
-                    st.session_state.db_consolidado = pd.concat(
-                        [st.session_state.db_consolidado, df_pdf],
-                        ignore_index=True
-                    )
+                pdfs = [os.path.join(DOWNLOAD_TEMPORARIO,f) for f in os.listdir(DOWNLOAD_TEMPORARIO) if f.lower().endswith(".pdf")]
+                if not pdfs:
+                    st.error("PDF não encontrado")
+                    continue
 
-        progress.progress(1.0)
-        st.success("✅ Processo concluído com sucesso!")
+                recente = max(pdfs, key=os.path.getctime)
+                destino = os.path.join(PASTA_FINAL, os.path.basename(recente))
+                shutil.move(recente, destino)
 
-    except Exception as e:
-        st.error(f"Erro: {e}")
+                df_pdf = parse_pdf_to_atendimentos_df(destino)
+                st.session_state.db_consolidado = pd.concat([st.session_state.db_consolidado, df_pdf], ignore_index=True)
+
+        st.success("✅ Processo finalizado")
+
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        driver.quit()
 
-# =========================
-# Resultados
-# =========================
+# ========= Resultado =========
 if not st.session_state.db_consolidado.empty:
-    st.divider()
-    df_preview = sanitize_df(st.session_state.db_consolidado)
-    st.subheader("📊 Base consolidada (temporária)")
-    st.dataframe(df_preview, use_container_width=True)
-
-    csv_bytes = df_preview.to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button("💾 Baixar Consolidação (CSV)", csv_bytes, file_name="consolidado_amhp.csv")
-
-    if st.button("🗑️ Limpar Banco Temporário"):
-        st.session_state.db_consolidado = pd.DataFrame()
-        st.rerun()
+    st.subheader("📊 Banco temporário")
+    st.dataframe(st.session_state.db_consolidado, use_container_width=True)
