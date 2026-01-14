@@ -1,35 +1,23 @@
 
 # -*- coding: utf-8 -*-
 """
-AMHP - Exportador PDF + Consolidador
+AMHP - Exportador PDF + Consolidador + Tratamento CSV legado
 
 Fluxo:
 1) Automatiza login e navegação no AMHPTISS.
-2) Exporta relatório de Atendimentos em PDF.
-3) Lê o PDF aplicando a mesma lógica da “Tabela — Atendimentos”.
+2) Exporta relatório de Atendimentos (PDF preferencial; CSV se necessário).
+3) Lê PDF/CSV aplicando a mesma lógica da “Tabela — Atendimentos”.
 4) Sanitiza, acrescenta metadados (Status/Negociação/Período) e consolida em memória.
 5) Permite baixar um CSV consolidado com múltiplos Status/Períodos.
+6) Uploader opcional para tratar CSVs legados “tortos”.
 
-Requisitos (requirements.txt):
-streamlit
-pandas
-selenium
-PyPDF2
-pdfplumber
-lxml
-beautifulsoup4
-(openpyxl/xlsxwriter são opcionais aqui)
-
-Para Streamlit Cloud (packages.txt — sem comentários):
-chromium
-chromium-driver
-libnss3
-libxss1
-libasound2
-libatk-bridge2.0-0
-libgtk-3-0
-libgbm1
-fonts-liberation
+Secrets (Streamlit):
+[credentials]
+usuario = "SEU_LOGIN_NO_AMHP"
+senha   = "SUA_SENHA_NO_AMHP"
+[env]
+CHROME_BINARY = "/usr/bin/chromium"
+CHROMEDRIVER_BINARY = "/usr/bin/chromedriver"
 """
 
 import os
@@ -67,8 +55,8 @@ except Exception:
     pass  # Execução local sem secrets de env
 
 # ========= CONFIG DA PÁGINA =========
-st.set_page_config(page_title="AMHP - Exportador PDF + Consolidação", layout="wide")
-st.title("🏥 Exportador AMHP (PDF) + Consolidador")
+st.set_page_config(page_title="AMHP - Exportador PDF/CSV + Consolidação", layout="wide")
+st.title("🏥 Exportador AMHP (PDF/CSV) + Consolidador")
 
 # ========= “BANCO” TEMPORÁRIO EM SESSÃO =========
 if "db_consolidado" not in st.session_state:
@@ -184,20 +172,20 @@ def switch_to_iframe_safe(driver, timeout=20, iframe_locator=None, index_fallbac
     except TimeoutException:
         pass
 
-# ========= PARSE DE PDF → DATAFRAME (Tabela — Atendimentos) =========
+# ========= PARSE PDF → Tabela — Atendimentos =========
 def parse_pdf_to_atendimentos_df(pdf_path: str) -> pd.DataFrame:
     """
     Extrai a Tabela — Atendimentos de um PDF do AMHPTISS/SSRS.
-    1) Tenta via PyPDF2 (texto), usando regex e heurísticas.
-    2) Se não conseguir, tenta via pdfplumber (tabelas) e normaliza para o mesmo esquema.
-    Retorna DataFrame com colunas:
+    1) PyPDF2 (texto) com regex/heurísticas.
+    2) Fallback pdfplumber (tabelas com linhas desenhadas).
+    Retorna colunas:
        ['Atendimento','NrGuia','Realizacao','Hora','TipoGuia',
         'Operadora','Matricula','Beneficiario','Credenciado','Prestador','ValorTotal']
     """
-    val_re = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}$")  # valor monetário pt-BR
-    code_name_re = re.compile(r"\d{3,6}-[^\d].+?")      # bloco "CODIGO-Nome" p/ credenciado/prestador
+    val_re = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}$")  # valor pt-BR
+    code_name_re = re.compile(r"\d{3,6}-[^\d].+?")      # bloco CODIGO-Nome
 
-    # ---------- 1) PyPDF2 (texto) ----------
+    # ---------- 1) PyPDF2 ----------
     try:
         from PyPDF2 import PdfReader
         reader = PdfReader(open(pdf_path, "rb"))
@@ -207,16 +195,16 @@ def parse_pdf_to_atendimentos_df(pdf_path: str) -> pd.DataFrame:
             txt = txt.replace("\u00A0", " ")
             lines.extend([l.strip() for l in txt.splitlines() if l.strip()])
 
-        # Localiza linha de cabeçalho (contém 'Atendimento' e 'Valor Total')
+        # Cabeçalho
         hdr_idx = -1
         for i, l in enumerate(lines):
             if ("Atendimento" in l) and ("Valor" in l) and ("Total" in l):
                 hdr_idx = i
                 break
         if hdr_idx == -1:
-            hdr_idx = 0  # fallback simples
+            hdr_idx = 0
 
-        # Percorre até a linha 'Total R$ ...'
+        # Linhas de dados até "Total R$ ..."
         data_lines = []
         for l in lines[hdr_idx+1:]:
             if l.startswith("Total "):
@@ -225,67 +213,52 @@ def parse_pdf_to_atendimentos_df(pdf_path: str) -> pd.DataFrame:
 
         parsed_rows = []
         for l in data_lines:
-            # 1) Valor no fim da linha
             m_val = val_re.search(l)
             if not m_val:
                 continue
             valor = m_val.group(0)
-            body = l[:m_val.start()].strip()
+            body  = l[:m_val.start()].strip()
 
-            # 2) Captura Prestador (último "CODIGO-Nome") e Credenciado (penúltimo)
             code_names = list(code_name_re.finditer(body))
-            prestador = code_names[-1].group(0) if code_names else ""
+            prestador  = code_names[-1].group(0) if code_names else ""
             if code_names:
                 body = body[:code_names[-1].start()].strip()
             credenciado = code_names[-2].group(0) if len(code_names) >= 2 else ""
             if len(code_names) >= 2:
                 body = body[:code_names[-2].start()].strip()
 
-            # 3) Cabeçalho fixo: Atendimento, NrGuia, Data, Hora
             m_head = re.match(r"^(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+(.*)$", body)
             if not m_head:
                 continue
             atendimento, nr_guia, realizacao, hora, rest = m_head.groups()
 
-            # 4) Rest: TipoGuia + Operadora + Matrícula + Beneficiário
             toks = rest.split()
+            def is_num(t): return re.fullmatch(r"\d+", t) is not None
 
-            def is_numeric_token(t):
-                return re.fullmatch(r"\d+", t) is not None
-
-            # início da matrícula
             idx_mat = None
             for i, t in enumerate(toks):
-                if is_numeric_token(t):
-                    idx_mat = i
-                    break
+                if is_num(t): idx_mat = i; break
             if idx_mat is None:
                 for i, t in enumerate(toks):
-                    if re.fullmatch(r"\d{6,}", t):
-                        idx_mat = i
-                        break
+                    if re.fullmatch(r"\d{6,}", t): idx_mat = i; break
 
             if idx_mat is None:
-                tipo_guia = toks[0]
-                operadora = " ".join(toks[1:]).strip()
-                matricula = ""
+                tipo_guia   = toks[0]
+                operadora   = " ".join(toks[1:]).strip()
+                matricula   = ""
                 beneficiario = ""
             else:
-                # TipoGuia pode ter 2 tokens (ex.: "SP/SADT PMDF")
                 if "/" in toks[0] and idx_mat >= 2 and re.fullmatch(r"[A-ZÁÉÍÓÚÂÊÔÃÕÇ\-]{2,15}", toks[1]):
-                    tipo_tokens = toks[0:2]
-                    start_oper = 2
+                    tipo_tokens = toks[0:2]; start_oper = 2
                 else:
-                    tipo_tokens = toks[0:1]
-                    start_oper = 1
-                tipo_guia = " ".join(tipo_tokens)
-                operadora = " ".join(toks[start_oper:idx_mat]).strip()
+                    tipo_tokens = toks[0:1]; start_oper = 1
+                tipo_guia   = " ".join(tipo_tokens)
+                operadora   = " ".join(toks[start_oper:idx_mat]).strip()
                 j = idx_mat
                 mat_tokens = []
-                while j < len(toks) and is_numeric_token(toks[j]):
-                    mat_tokens.append(toks[j])
-                    j += 1
-                matricula = " ".join(mat_tokens)
+                while j < len(toks) and is_num(toks[j]):
+                    mat_tokens.append(toks[j]); j += 1
+                matricula    = " ".join(mat_tokens)
                 beneficiario = " ".join(toks[j:]).strip()
 
             parsed_rows.append({
@@ -304,20 +277,17 @@ def parse_pdf_to_atendimentos_df(pdf_path: str) -> pd.DataFrame:
 
         df = pd.DataFrame(parsed_rows)
         if not df.empty:
-            # Ordena por data/hora
             try:
                 df["Realizacao_dt"] = pd.to_datetime(df["Realizacao"], format="%d/%m/%Y")
-                df = df.sort_values(["Realizacao_dt", "Hora"]).drop(columns=["Realizacao_dt"])
+                df = df.sort_values(["Realizacao_dt","Hora"]).drop(columns=["Realizacao_dt"])
             except Exception:
                 pass
-            # Sanitiza e retorna
-            df = sanitize_df(df)
-            return df
+            return sanitize_df(df)
 
     except Exception:
-        pass  # continua no fallback
+        pass  # fallback pdfplumber
 
-    # ---------- 2) pdfplumber (tabela com linhas desenhadas) ----------
+    # ---------- 2) pdfplumber ----------
     try:
         import pdfplumber
         tables_concat = []
@@ -329,7 +299,6 @@ def parse_pdf_to_atendimentos_df(pdf_path: str) -> pd.DataFrame:
                         tables_concat.append(pd.DataFrame(tbl))
         if tables_concat:
             df_temp = pd.concat(tables_concat, ignore_index=True)
-            # encontra linha do cabeçalho
             header_idx = -1
             for i, row in df_temp.iterrows():
                 row_str = " ".join([str(v).replace("\u00A0", " ") for v in row.values])
@@ -339,16 +308,13 @@ def parse_pdf_to_atendimentos_df(pdf_path: str) -> pd.DataFrame:
             if header_idx == -1:
                 header_idx = 0
 
-            # aplica cabeçalho
             df = df_temp.iloc[header_idx+1:].copy()
             header = df_temp.iloc[header_idx].astype(str).tolist()
             df.columns = header[:len(df.columns)]
 
-            # mapeia nomes para o esquema final
             def pick(df_cols, candidates):
                 for c in candidates:
-                    if c in df_cols:
-                        return c
+                    if c in df_cols: return c
                 return None
 
             col_map = {
@@ -382,17 +348,172 @@ def parse_pdf_to_atendimentos_df(pdf_path: str) -> pd.DataFrame:
                 })
 
             df_out = pd.DataFrame(rows_norm)
-            df_out = sanitize_df(df_out)
-            return df_out
+            return sanitize_df(df_out)
 
     except Exception:
         pass
 
-    # Se nada deu certo, retorna dataframe vazio com esquema final
     return pd.DataFrame(columns=[
         "Atendimento","NrGuia","Realizacao","Hora","TipoGuia","Operadora",
         "Matricula","Beneficiario","Credenciado","Prestador","ValorTotal"
     ])
+
+# ========= TRATAR CSV legado → Tabela — Atendimentos =========
+def fix_messy_export_to_atendimentos_df(csv_path_or_str) -> pd.DataFrame:
+    """
+    Normaliza um CSV "bagunçado" (linhas coladas em 'Atendimento', quebras indevidas,
+    'Total R$ ...' colado etc.) para o esquema:
+      ['Atendimento','NrGuia','Realizacao','Hora','TipoGuia','Operadora',
+       'Matricula','Beneficiario','Credenciado','Prestador','ValorTotal']
+    """
+    # Carrega texto bruto (path ou conteúdo)
+    if "\n" in str(csv_path_or_str) and not str(csv_path_or_str).lower().endswith(".csv"):
+        raw = csv_path_or_str
+    else:
+        with open(csv_path_or_str, "r", encoding="utf-8") as f:
+            raw = f.read()
+
+    df = pd.read_csv(io.StringIO(raw), dtype=str, keep_default_na=False)
+
+    val_any    = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")         # valor "pt-BR"
+    re_total   = re.compile(r"Total\s*R\$\s*\d{1,3}(?:\.\d{3})*,\d{2}", re.I)
+    code_start = re.compile(r"\d{3,6}-")                          # início "CODIGO-"
+
+    def norm(s):
+        if s is None: return ""
+        return (str(s)
+                .replace("\u00A0", " ")
+                .replace("\r", " ")
+                .replace("\n", " ")
+                .replace("\t", " ")
+                .strip())
+
+    records, buf = [], ""
+    for _, row in df.iterrows():
+        at  = norm(row.get("Atendimento"))
+        ng  = norm(row.get("NrGuia"))
+        dt  = norm(row.get("Realizacao"))
+        hr  = norm(row.get("Hora"))
+        tg  = norm(row.get("TipoGuia"))
+        op  = norm(row.get("Operadora"))
+        mat = norm(row.get("Matricula"))
+        ben = norm(row.get("Beneficiario"))
+        cre = norm(row.get("Credenciado"))
+        pre = norm(row.get("Prestador"))
+        vl  = norm(row.get("ValorTotal"))
+
+        if at:
+            at = re_total.sub("", at).strip()  # remove "Total R$ ..." colado
+
+        if at.lower().startswith("total "):
+            continue
+
+        columnar    = all([at, ng, dt, hr, tg]) and bool(vl)
+        concat_like = (at and not ng and not dt and not hr and not tg
+                       and not op and not mat and not ben and not cre and not pre and not vl)
+
+        if columnar:
+            line = f"{at} {ng} {dt} {hr} {tg} {op} {mat} {ben} {cre} {pre} {vl}"
+            line = re_total.sub("", line).strip()
+            records.append(re.sub(r"\s+", " ", line).strip())
+            continue
+
+        if concat_like:
+            buf = (buf + " " + at).strip() if buf else at
+            if val_any.search(at):  # final da linha (tem valor)
+                rec = re_total.sub("", buf).strip()
+                records.append(re.sub(r"\s+", " ", rec).strip())
+                buf = ""
+            continue
+
+    if buf and val_any.search(buf):
+        rec = re_total.sub("", buf).strip()
+        records.append(re.sub(r"\s+", " ", rec).strip())
+        buf = ""
+
+    # Converte "linha única" em colunas finais
+    parsed = []
+    for l in records:
+        vals = list(val_any.finditer(l))
+        if not vals:
+            continue
+        m_val = vals[-1]
+        valor = m_val.group(0)
+        body  = (l[:m_val.start()] + l[m_val.end():]).strip()
+
+        # última e penúltima ocorrências "CODIGO-" → Prestador/Credenciado
+        starts = [m.start() for m in code_start.finditer(body)]
+        if starts:
+            if len(starts) >= 2:
+                i1, i2 = starts[-2], starts[-1]
+                prest   = body[i2:].strip()
+                tmp     = body[:i2].strip()
+                cred    = tmp[i1:].strip()
+                body    = tmp[:i1].strip()
+            else:
+                i2      = starts[-1]
+                prest   = body[i2:].strip()
+                cred    = ""
+                body    = body[:i2].strip()
+        else:
+            cred = prest = ""
+
+        m_head = re.match(r"^(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+(.*)$", body)
+        if not m_head:
+            continue
+        atendimento, nr_guia, realizacao, hora, rest = m_head.groups()
+
+        toks = rest.split()
+        def is_num(t): return re.fullmatch(r"\d+", t) is not None
+
+        idx_mat = None
+        for i, t in enumerate(toks):
+            if is_num(t): idx_mat = i; break
+        if idx_mat is None:
+            for i, t in enumerate(toks):
+                if re.fullmatch(r"\d{6,}", t): idx_mat = i; break
+
+        if idx_mat is None:
+            tipo_guia   = toks[0]
+            operadora   = " ".join(toks[1:]).strip()
+            matricula   = ""
+            beneficiario = ""
+        else:
+            if "/" in toks[0] and idx_mat >= 2 and re.fullmatch(r"[A-ZÁÉÍÓÚÂÊÔÃÕÇ\-]{2,15}", toks[1]):
+                tipo_tokens = toks[0:2]; start_oper = 2
+            else:
+                tipo_tokens = toks[0:1]; start_oper = 1
+            tipo_guia   = " ".join(tipo_tokens)
+            operadora   = " ".join(toks[start_oper:idx_mat]).strip()
+            j = idx_mat
+            mat_tokens = []
+            while j < len(toks) and is_num(toks[j]):
+                mat_tokens.append(toks[j]); j += 1
+            matricula    = " ".join(mat_tokens)
+            beneficiario = " ".join(toks[j:]).strip()
+
+        parsed.append({
+            "Atendimento": atendimento,
+            "NrGuia": nr_guia,
+            "Realizacao": realizacao,
+            "Hora": hora,
+            "TipoGuia": tipo_guia,
+            "Operadora": operadora,
+            "Matricula": matricula,
+            "Beneficiario": beneficiario,
+            "Credenciado": cred,
+            "Prestador": prest,
+            "ValorTotal": valor,
+        })
+
+    df_out = pd.DataFrame(parsed)
+    if not df_out.empty:
+        try:
+            df_out["Realizacao_dt"] = pd.to_datetime(df_out["Realizacao"], format="%d/%m/%Y")
+            df_out = df_out.sort_values(["Realizacao_dt","Hora"]).drop(columns=["Realizacao_dt"])
+        except Exception:
+            pass
+    return sanitize_df(df_out)
 
 # ========= UI =========
 with st.sidebar:
@@ -416,8 +537,33 @@ with st.sidebar:
     wait_time_main = st.number_input("⏱️ Tempo extra pós login/troca de tela (s)", min_value=0, value=10)
     wait_time_download = st.number_input("⏱️ Tempo extra para concluir download (s)", min_value=10, value=18)
 
-# ========= BOTÃO PRINCIPAL =========
-if st.button("🚀 Iniciar Processo (PDF)"):
+    st.divider()
+    st.subheader("🧩 Tratar CSV legado (opcional)")
+    csv_file = st.file_uploader("Arraste um CSV legado (.csv) do AMHP/SSRS", type=["csv"])
+    if csv_file:
+        if st.button("🔧 Corrigir CSV legado e consolidar"):
+            try:
+                raw_content = csv_file.getvalue().decode("utf-8", errors="ignore")
+                df_corr = fix_messy_export_to_atendimentos_df(raw_content)
+                if df_corr.empty:
+                    st.warning("Não foi possível extrair linhas do CSV. Verifique o conteúdo.")
+                else:
+                    # metadados opcionais: usa os do painel
+                    df_corr["Filtro_Negociacao"] = sanitize_value(negociacao)
+                    df_corr["Filtro_Status"]     = "CSV Legado"
+                    df_corr["Periodo_Inicio"]    = sanitize_value(data_ini)
+                    df_corr["Periodo_Fim"]       = sanitize_value(data_fim)
+
+                    st.session_state.db_consolidado = pd.concat(
+                        [st.session_state.db_consolidado, df_corr],
+                        ignore_index=True
+                    )
+                    st.success(f"✅ {len(df_corr)} linhas tratadas e adicionadas à consolidação!")
+            except Exception as e:
+                st.error(f"Falha ao tratar CSV: {e}")
+
+# ========= BOTÃO PRINCIPAL (Automação) =========
+if st.button("🚀 Iniciar Processo (PDF/CSV)"):
     driver = configurar_driver()
     try:
         with st.status("Trabalhando...", expanded=True) as status:
@@ -445,7 +591,7 @@ if st.button("🚀 Iniciar Processo (PDF)"):
             if len(driver.window_handles) > 1:
                 driver.switch_to.window(driver.window_handles[-1])
 
-            # 3. LIMPEZA DE BLOQUEIOS (Pop-ups e Overlays)
+            # 3. LIMPEZA DE BLOQUEIOS
             st.write("🧹 Limpando tela...")
             try:
                 driver.execute_script("""
@@ -491,7 +637,6 @@ if st.button("🚀 Iniciar Processo (PDF)"):
 
                 # Tabela
                 wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".rgMasterTable")))
-                # Seleciona checkbox geral
                 driver.execute_script("document.getElementById('ctl00_MainContent_rdgAtendimentosRealizados_ctl00_ctl02_ctl00_SelectColumnSelectCheckBox').click();")
                 time.sleep(2)
 
@@ -503,71 +648,105 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                 if len(driver.find_elements(By.TAG_NAME, "iframe")) > 0:
                     driver.switch_to.frame(0)
 
-                # Exportar como PDF
+                # Exportar (PDF preferido; CSV opcional)
                 dropdown = wait.until(EC.presence_of_element_located((By.ID, "ReportView_ReportToolbar_ExportGr_FormatList_DropDownList")))
+                # Se preferir CSV em algum cenário, troque para "CSV"
                 Select(dropdown).select_by_value("PDF")
                 time.sleep(2)
                 export_btn = driver.find_element(By.ID, "ReportView_ReportToolbar_ExportGr_Export")
                 driver.execute_script("arguments[0].click();", export_btn)
 
-                st.write("📥 Concluindo download do PDF...")
+                st.write("📥 Concluindo download...")
                 time.sleep(wait_time_download)
 
-                # PROCESSA ARQUIVO
-                arquivos = [os.path.join(DOWNLOAD_TEMPORARIO, f) for f in os.listdir(DOWNLOAD_TEMPORARIO) if f.lower().endswith(".pdf")]
+                # PROCESSA ARQUIVO (PDF/CSV)
+                arquivos = [os.path.join(DOWNLOAD_TEMPORARIO, f) for f in os.listdir(DOWNLOAD_TEMPORARIO)
+                            if f.lower().endswith((".pdf", ".csv"))]
                 if arquivos:
                     recente = max(arquivos, key=os.path.getctime)
-                    # Move p/ pasta final com nome organizado
-                    nome_pdf = f"Relatorio_{status_sel.replace(' ', '_').replace('/','-')}_{data_ini.replace('/','-')}_a_{data_fim.replace('/','-')}.pdf"
-                    destino_pdf = os.path.join(PASTA_FINAL, nome_pdf)
-                    shutil.move(recente, destino_pdf)
-                    st.success(f"✅ PDF salvo: {destino_pdf}")
+                    ext = os.path.splitext(recente)[1].lower()
 
-                    # Lê PDF → DataFrame (Tabela — Atendimentos)
-                    st.write("📄 Lendo dados do PDF...")
-                    df_pdf = parse_pdf_to_atendimentos_df(destino_pdf)
+                    if ext == ".pdf":
+                        # Move e processa PDF
+                        nome_pdf = f"Relatorio_{status_sel.replace(' ', '_').replace('/','-')}_{data_ini.replace('/','-')}_a_{data_fim.replace('/','-')}.pdf"
+                        destino_pdf = os.path.join(PASTA_FINAL, nome_pdf)
+                        shutil.move(recente, destino_pdf)
+                        st.success(f"✅ PDF salvo: {destino_pdf}")
 
-                    if not df_pdf.empty:
-                        # Metadados de filtro
-                        df_pdf["Filtro_Negociacao"] = sanitize_value(negociacao)
-                        df_pdf["Filtro_Status"] = sanitize_value(status_sel)
-                        df_pdf["Periodo_Inicio"] = sanitize_value(data_ini)
-                        df_pdf["Periodo_Fim"] = sanitize_value(data_fim)
+                        st.write("📄 Lendo dados do PDF...")
+                        df_pdf = parse_pdf_to_atendimentos_df(destino_pdf)
 
-                        # Total do PDF atual (somatório dos valores)
-                        def to_float_br(s):
-                            try:
-                                return float(str(s).replace('.', '').replace(',', '.'))
-                            except Exception:
-                                return 0.0
-                        total_pdf = df_pdf["ValorTotal"].apply(to_float_br).sum()
-                        total_pdf_br = f"R$ {total_pdf:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-                        st.info(f"📑 Total do PDF atual: **{total_pdf_br}**")
+                        if not df_pdf.empty:
+                            # Metadados de filtro
+                            df_pdf["Filtro_Negociacao"] = sanitize_value(negociacao)
+                            df_pdf["Filtro_Status"]     = sanitize_value(status_sel)
+                            df_pdf["Periodo_Inicio"]    = sanitize_value(data_ini)
+                            df_pdf["Periodo_Fim"]       = sanitize_value(data_fim)
 
-                        # Preview formatado (colunas principais)
-                        cols_show = ["Atendimento","NrGuia","Realizacao","Hora","TipoGuia",
-                                     "Operadora","Matricula","Beneficiario","Credenciado",
-                                     "Prestador","ValorTotal"]
-                        st.dataframe(df_pdf[cols_show], use_container_width=True)
+                            # Total do PDF atual
+                            def to_float_br(s):
+                                try: return float(str(s).replace('.', '').replace(',', '.'))
+                                except: return 0.0
+                            total_pdf = df_pdf["ValorTotal"].apply(to_float_br).sum()
+                            total_pdf_br = f"R$ {total_pdf:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                            st.info(f"📑 Total do PDF atual: **{total_pdf_br}**")
 
-                        # Consolida no “banco” temporário
-                        st.session_state.db_consolidado = pd.concat(
-                            [st.session_state.db_consolidado, df_pdf],
-                            ignore_index=True
-                        )
-                        st.write(f"📊 Registros acumulados: {len(st.session_state.db_consolidado)}")
-                    else:
-                        st.warning("⚠️ Não foi possível extrair linhas do PDF (tabelas não detectadas). Verifique o arquivo salvo.")
+                            # Preview
+                            cols_show = ["Atendimento","NrGuia","Realizacao","Hora","TipoGuia",
+                                         "Operadora","Matricula","Beneficiario","Credenciado",
+                                         "Prestador","ValorTotal"]
+                            st.dataframe(df_pdf[cols_show], use_container_width=True)
 
-                    # Volta do iframe para a página de filtros
-                    try:
-                        driver.switch_to.default_content()
-                    except Exception:
-                        pass
+                            # Consolida
+                            st.session_state.db_consolidado = pd.concat(
+                                [st.session_state.db_consolidado, df_pdf],
+                                ignore_index=True
+                            )
+                            st.write(f"📊 Registros acumulados: {len(st.session_state.db_consolidado)}")
+                        else:
+                            st.warning("⚠️ Não foi possível extrair linhas do PDF. Verifique o arquivo salvo.")
 
+                        try:
+                            driver.switch_to.default_content()
+                        except Exception:
+                            pass
+
+                    elif ext == ".csv":
+                        # Move e trata CSV legado
+                        nome_csv = f"Relatorio_{status_sel.replace(' ', '_').replace('/','-')}_{data_ini.replace('/','-')}_a_{data_fim.replace('/','-')}.csv"
+                        destino_csv = os.path.join(PASTA_FINAL, nome_csv)
+                        shutil.move(recente, destino_csv)
+                        st.success(f"✅ CSV salvo: {destino_csv}")
+
+                        st.write("📄 Tratando CSV legado e normalizando...")
+                        df_csv = fix_messy_export_to_atendimentos_df(destino_csv)
+
+                        if not df_csv.empty:
+                            df_csv["Filtro_Negociacao"] = sanitize_value(negociacao)
+                            df_csv["Filtro_Status"]     = sanitize_value(status_sel)
+                            df_csv["Periodo_Inicio"]    = sanitize_value(data_ini)
+                            df_csv["Periodo_Fim"]       = sanitize_value(data_fim)
+
+                            # Preview
+                            cols_show = ["Atendimento","NrGuia","Realizacao","Hora","TipoGuia",
+                                         "Operadora","Matricula","Beneficiario","Credenciado",
+                                         "Prestador","ValorTotal"]
+                            st.dataframe(df_csv[cols_show], use_container_width=True)
+
+                            st.session_state.db_consolidado = pd.concat(
+                                [st.session_state.db_consolidado, df_csv],
+                                ignore_index=True
+                            )
+                            st.write(f"📊 Registros acumulados: {len(st.session_state.db_consolidado)}")
+                        else:
+                            st.warning("⚠️ CSV não pôde ser normalizado. Verifique o conteúdo.")
+
+                        try:
+                            driver.switch_to.default_content()
+                        except Exception:
+                            pass
                 else:
-                    st.error("❌ PDF não encontrado após o download. O SSRS pode ter demorado ou bloqueado.")
-                    # Volta do iframe para tentar continuar
+                    st.error("❌ Arquivo não encontrado após o download. O SSRS pode ter demorado ou bloqueado.")
                     try:
                         driver.switch_to.default_content()
                     except Exception:
