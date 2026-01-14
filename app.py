@@ -10,24 +10,27 @@ import time
 import os
 import shutil
 
-# --- CONFIGURAÇÃO DE DIRETÓRIOS ---
-# No Streamlit Cloud, usamos o /tmp para downloads por ser uma pasta com permissão de escrita
-DOWNLOAD_PATH = "/tmp/downloads"
-FINAL_PATH = "/tmp/automacao_excel"
+# --- DEFINIÇÃO DE CAMINHOS LOCAIS (WINDOWS) ---
+# Detecta a pasta Desktop do usuário atual
+DESKTOP_PATH = os.path.join(os.path.expanduser("~"), "Desktop")
+PASTA_FINAL = os.path.join(DESKTOP_PATH, "automacao_excel")
+DOWNLOAD_TEMPORARIO = os.path.join(os.getcwd(), "temp_downloads")
 
-for p in [DOWNLOAD_PATH, FINAL_PATH]:
+# Cria as pastas se não existirem
+for p in [PASTA_FINAL, DOWNLOAD_TEMPORARIO]:
     if not os.path.exists(p):
         os.makedirs(p)
 
 def iniciar_driver():
     options = Options()
-    options.add_argument("--headless")
+    # options.add_argument("--headless") # Desative o headless se quiser ver o processo
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
     
+    # Configura o Chrome para baixar na nossa pasta temporária
     prefs = {
-        "download.default_directory": DOWNLOAD_PATH,
+        "download.default_directory": DOWNLOAD_TEMPORARIO,
         "download.prompt_for_download": False,
         "download.directory_upgrade": True,
         "safebrowsing.enabled": True
@@ -40,20 +43,20 @@ def iniciar_driver():
     except:
         return webdriver.Chrome(options=options)
 
-st.title("🏥 Exportador de Relatórios AMHP")
+st.title("🏥 Exportador AMHP para Área de Trabalho")
 
 col1, col2 = st.columns(2)
 with col1: data_ini = st.text_input("📅 Data Inicial", value="01/01/2026")
 with col2: data_fim = st.text_input("📅 Data Final", value="13/01/2026")
 
-if st.button("🚀 Gerar e Baixar Excel"):
+if st.button("🚀 Gerar e Salvar no Desktop"):
     driver = iniciar_driver()
     if driver:
         try:
-            with st.status("Executando automação...", expanded=True) as status:
+            with st.status("Processando...", expanded=True) as status:
                 wait = WebDriverWait(driver, 30)
                 
-                # LOGIN (Simplificado)
+                # LOGIN
                 driver.get("https://portal.amhp.com.br/")
                 wait.until(EC.presence_of_element_located((By.ID, "input-9"))).send_keys(st.secrets["credentials"]["usuario"])
                 driver.find_element(By.ID, "input-12").send_keys(st.secrets["credentials"]["senha"] + Keys.ENTER)
@@ -83,71 +86,60 @@ if st.button("🚀 Gerar e Baixar Excel"):
                 preencher("ctl00_MainContent_rcbTipoNegociacao_Input", "Direto")
                 preencher("ctl00_MainContent_rcbStatus_Input", "300 - Pronto para Processamento")
                 
-                # Datas (Usando TAB para validar)
-                d_ini = driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataInicio_dateInput")
-                d_ini.send_keys(data_ini + Keys.TAB)
-                d_fim = driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataFim_dateInput")
-                d_fim.send_keys(data_fim + Keys.TAB)
+                # DATAS
+                driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataInicio_dateInput").send_keys(data_ini + Keys.TAB)
+                driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataFim_dateInput").send_keys(data_fim + Keys.TAB)
 
                 # BUSCAR E SELECIONAR
-                st.write("🔍 Buscando dados...")
+                st.write("🔍 Buscando e selecionando todos...")
                 driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "ctl00_MainContent_btnBuscar_input"))
-                
                 wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".rgMasterTable")))
-                st.write("✅ Selecionando todos os registros...")
+                
                 driver.execute_script("arguments[0].click();", wait.until(EC.element_to_be_clickable((By.ID, "ctl00_MainContent_rdgAtendimentosRealizados_ctl00_ctl02_ctl00_SelectColumnSelectCheckBox"))))
                 time.sleep(4)
 
-                # IMPRIMIR
-                st.write("🖨️ Abrindo visualização de relatório...")
+                # IMPRIMIR E EXPORTAR
+                st.write("🖨️ Abrindo relatório...")
                 driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "ctl00_MainContent_rbtImprimirAtendimentos_input"))
-                time.sleep(12) # Aguarda o carregamento do relatório
+                time.sleep(12)
 
-                # --- TRATAMENTO DO IFRAME E EXPORTAÇÃO ---
-                st.write("📊 Tentando localizar controles de exportação...")
-                
-                # Verifica se o relatório abriu em um Iframe
+                # Lógica de Iframe para Exportação
                 iframes = driver.find_elements(By.TAG_NAME, "iframe")
-                if len(iframes) > 0:
-                    driver.switch_to.frame(0) # Entra no primeiro iframe (comum em relatórios ASP)
+                if len(iframes) > 0: driver.switch_to.frame(0)
 
                 try:
-                    # Tenta selecionar o formato via JavaScript (mais seguro para componentes Telerik)
                     dropdown = wait.until(EC.presence_of_element_located((By.ID, "ReportView_ReportToolbar_ExportGr_FormatList_DropDownList")))
                     Select(dropdown).select_by_value("XLS")
                     time.sleep(2)
-                    
-                    btn_exportar = driver.find_element(By.ID, "ReportView_ReportToolbar_ExportGr_Export")
-                    driver.execute_script("arguments[0].click();", btn_exportar)
-                    st.write("📥 Download solicitado!")
-                except Exception as e:
-                    st.warning("Falha ao interagir com o menu de exportação. Tentando modo alternativo...")
-                    # Tenta clicar direto no link se o Select falhar
+                    driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "ReportView_ReportToolbar_ExportGr_Export"))
+                    st.write("📥 Exportação iniciada...")
+                except:
+                    # Fallback via JS
                     driver.execute_script("document.getElementById('ReportView_ReportToolbar_ExportGr_FormatList_DropDownList').value = 'XLS';")
                     driver.execute_script("document.getElementById('ReportView_ReportToolbar_ExportGr_Export').click();")
 
-                time.sleep(10) # Tempo para baixar
+                # Aguarda o download concluir na pasta temporária
+                time.sleep(12)
 
-                # --- RENOMEAR E MOVER ---
-                arquivos = os.listdir(DOWNLOAD_PATH)
+                # --- MOVIMENTAÇÃO PARA O DESKTOP ---
+                arquivos = os.listdir(DOWNLOAD_TEMPORARIO)
                 if arquivos:
-                    recente = max([os.path.join(DOWNLOAD_PATH, f) for f in arquivos], key=os.path.getctime)
-                    nome_final = "300_Pronto_Processamento_Direto.xls"
-                    caminho_final = os.path.join(FINAL_PATH, nome_final)
+                    # Pega o arquivo baixado
+                    recente = max([os.path.join(DOWNLOAD_TEMPORARIO, f) for f in arquivos], key=os.path.getctime)
                     
+                    # Nome solicitado: Status + Negociação
+                    nome_arquivo = "300_Pronto_Processamento_Direto.xls"
+                    caminho_final = os.path.join(PASTA_FINAL, nome_arquivo)
+                    
+                    # Move da pasta temporária para a pasta na Área de Trabalho
                     shutil.move(recente, caminho_final)
-                    st.success(f"✅ Arquivo salvo com sucesso!")
-                    
-                    with open(caminho_final, "rb") as f:
-                        st.download_button("💾 Clique aqui para baixar o Excel", f, file_name=nome_final)
+                    st.success(f"✅ Relatório salvo na Área de Trabalho: automacao_excel/{nome_arquivo}")
                 else:
-                    st.error("❌ O arquivo não foi encontrado na pasta de downloads.")
-                
-                status.update(label="Processo Finalizado!", state="complete")
+                    st.error("❌ Arquivo não localizado. Verifique se o download iniciou.")
+
+                status.update(label="Concluído!", state="complete")
 
         except Exception as e:
-            st.error(f"🚨 Erro crítico: {e}")
-            driver.save_screenshot("erro_captura.png")
-            st.image("erro_captura.png")
+            st.error(f"🚨 Erro: {e}")
         finally:
             driver.quit()
