@@ -1,5 +1,4 @@
 
-# automation/reports.py
 import re
 from pathlib import Path
 import requests
@@ -73,7 +72,7 @@ def post_export(session: requests.Session,
 
 def save_download_response(session: requests.Session, response: requests.Response, action_url: str, out_path: Path):
     """
-    Salva direto se vier binário (PDF/CSV/XLS) ou tenta achar link ... para o arquivo.
+    Salva direto se vier binário (PDF/CSV/XLS) ou tenta achar link <a href='...rquivo.
     """
     ct = response.headers.get("Content-Type", "").lower()
     content = response.content
