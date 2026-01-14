@@ -153,14 +153,18 @@ def _preclean_report_text(raw: str) -> str:
       • dois blocos numéricos longos (Atendimento e NrGuia),
       • Data↔Hora,
       • Hora↔TipoGuia,
-      • TipoGuia↔Operadora (p.ex. 'SP/SADTBACEN(104)' ou 'ConsultaGDF SAÚDE'),
-      • ')'↔Matrícula.
-    - Normaliza whitespace.
+      • TipoGuia↔Operadora,
+      • ')'↔Matrícula,
+      • Matrícula (bloco numérico) ↔ Nome (letra inicial).
+    - Normaliza escapes (\, \(, \)) e whitespace.
     """
     if not raw:
         return ""
     txt = raw.replace("\u00A0", " ")
     txt = _ILLEGAL_CTRL_RE.sub("", txt)
+
+    # Normaliza escapes vindos do ReportViewer
+    txt = txt.replace(r"\-", "-").replace(r"\(", "(").replace(r"\)", ")")  # NEW
 
     # Inserir espaço entre dois blocos numéricos longos colados
     txt = re.sub(r"(\d{6,})(\d{6,})", r"\1 \2", txt)
@@ -171,18 +175,18 @@ def _preclean_report_text(raw: str) -> str:
     # Espaço entre Hora e próximo token alfabético (Tipo de Guia)
     txt = re.sub(r"(\d{2}:\d{2})(?=[A-Za-zÁ-Úá-úNÇS/])", r"\1 ", txt)
 
-    # Espaço entre Tipo de Guia e Operadora coladas (casos amplos)
-    # PATCH #1: amplia separação de colagens com/sem parênteses logo após
+    # Espaço entre Tipo de Guia e Operadora coladas
     txt = re.sub(r'(?i)\b(Consulta)(?=[A-ZÁ-Ú])', r'\1 ', txt)
     txt = re.sub(r'(?i)\b(SP/SADT)(?=[A-ZÁ-Ú])', r'\1 ', txt)
     txt = re.sub(r'(?i)\b(Honorário(?:\s*Individual)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', txt)
     txt = re.sub(r'(?i)\b(Não(?:\s*TISS)?(?:\s*-\s*Atendimento)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', txt)
-
-    # Casos com parênteses imediatamente após (mantido)
     txt = re.sub(r"(Consulta|SP/SADT)(?=[A-Z]{2,}\()", r"\1 ", txt)
 
     # Espaço entre ')' e matrícula coladas
     txt = re.sub(r"(\))(\d{5,})", r"\1 \2", txt)
+
+    # NEW: Espaço entre matrícula (bloco numérico longo) e início do nome (letra)
+    txt = re.sub(r"(\d{5,})([A-ZÁ-Ú])", r"\1 \2", txt)
 
     # Corta antes/até o cabeçalho e começa APÓS 'Valor Total'
     m = re.search(r"(Atendimento\s*Nr\.?\s*Guia.*?Valor\s*Total)", txt, flags=re.I|re.S)
@@ -396,66 +400,31 @@ def to_float_br(s):
     except Exception:
         return 0.0
 
-# ========= NOVO PARSER UNIFICADO (streaming) — REESCRITO =========
+# ========= NOVO PARSER UNIFICADO (streaming) — AJUSTADO =========
 def parse_streaming_any(texto: str) -> pd.DataFrame:
     """
-    Parser unificado (streaming) para o texto do ReportViewer (SSRS), robusto a colagens.
-    Fluxo:
-      1) Pré-processamento/normalização (inclui 'pulo do gato' para colagens).
-      2) Segmentação por Cabeçalho (colado ou separado), escolhendo o padrão dominante.
-      3) Âncora de fim: último valor monetário no segmento define o fim do registro.
-      4) Extração do corpo dinâmico:
-           - TipoGuia = 1º token após Hora (com correções de colagens).
-           - Operadora = até o primeiro token que seja Matrícula (alfa-num longo).
-           - Matrícula = sequência de tokens alfanuméricos longos (>=5).
-           - Beneficiário = tokens após a Matrícula.
-           - Credenciado/Prestador = detectados por padrão de códigos "000000-".
-      5) Montagem do DataFrame com schema padrão e ordenação por Data+Hora.
+    Parser unificado (streaming) — robusto a colagens em SSRS:
+      1) Pré-processamento e 'pulo do gato' (espaços entre dígitos≥10 ↔ Data, Hora ↔ Tipo,
+         ')' ↔ Matrícula, Matrícula ↔ Nome; normalização de escapes).
+      2) Segmentação por cabeçalho unificado (com/sem NrGuia explícito).
+      3) Âncora de fim: último valor monetário dentro/ao redor do segmento.
+      4) Extração: TipoGuia, Operadora, Matrícula(s), Beneficiário, Credenciado/Prestador.
+      5) Retorna DataFrame no schema TARGET_COLS.
     """
     import re
     import pandas as pd
 
-    # ---------- HELPERS locais ----------
     def _ws(s: str) -> str:
-        """Normaliza whitespaces e NBSP."""
         return re.sub(r"\s+", " ", (s or "").replace("\u00A0", " ")).strip()
 
     def _drop_header_and_total(raw: str) -> str:
-        """
-        Remove preâmbulo/cabeçalho (começa logo após 'Valor Total') e apaga blocos de 'Total R$'.
-        """
         txt = _ws(raw)
-        # Corta após a linha de cabeçalho principal:
         m = re.search(r"(Atendimento\s*Nr\.?\s*Guia.*?Valor\s*Total)", txt, flags=re.I | re.S)
-        if m:
-            txt = txt[m.end():]
-        else:
-            # Fallback: começa da 1ª ocorrência padrão (Atend + NrGuia + Data + Hora)
-            m2 = re.search(r"\d{6,}\s+\d{6,}\s+\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}", txt)
-            if m2:
-                txt = txt[m2.start():]
-        # Remove blocos 'Total R$'
+        if m: txt = txt[m.end():]
         txt = re.sub(r"total\s*r\$\s*\d{1,3}(?:\.\d{3})*,\d{2}", "", txt, flags=re.I)
         return _ws(txt)
 
-    def _insert_spaces_patches(s: str) -> str:
-        """
-        Corrige colagens típicas: Atendimento↔NrGuia, Data↔Hora, Hora↔TipoGuia,
-        TipoGuia↔Operadora (Consulta/ SP-SADT / Honorário / Não TISS), ')'↔Matrícula.
-        """
-        s = re.sub(r"(\d{6,})(\d{6,})", r"\1 \2", s)  # Atendimento + NrGuia colados
-        s = re.sub(r"(\d{2}/\d{2}/\d{4})(\d{2}:\d{2})", r"\1 \2", s)  # Data+Hora
-        s = re.sub(r"(\d{2}:\d{2})(?=[A-Za-zÁ-Úá-úNÇS/])", r"\1 ", s)  # Hora + TipoGuia
-        s = re.sub(r'(?i)\b(Consulta)(?=[A-ZÁ-Ú])', r'\1 ', s)
-        s = re.sub(r'(?i)\b(SP/SADT)(?=[A-ZÁ-Ú])', r'\1 ', s)
-        s = re.sub(r'(?i)\b(Honorário(?:\s*Individual)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', s)
-        s = re.sub(r'(?i)\b(Não(?:\s*TISS)?(?:\s*-\s*Atendimento)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', s)
-        s = re.sub(r"(Consulta|SP/SADT)(?=[A-Z]{2,}\()", r"\1 ", s)  # parênteses abrindo
-        s = re.sub(r"(\))(\d{5,})", r"\1 \2", s)  # ')' colado na matrícula
-        return _ws(s)
-
     def _normalize_tipo_operadora(rest: str) -> str:
-        """Aplica novamente os patches de colagem (garante robustez após recorte do segmento)."""
         rest = re.sub(r'(?i)\b(Consulta)(?=[A-ZÁ-Ú])', r'\1 ', rest)
         rest = re.sub(r'(?i)\b(SP/SADT)(?=[A-ZÁ-Ú])', r'\1 ', rest)
         rest = re.sub(r'(?i)\b(Honorário(?:\s*Individual)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', rest)
@@ -463,75 +432,83 @@ def parse_streaming_any(texto: str) -> pd.DataFrame:
         rest = re.sub(r"(Consulta|SP/SADT)(?=[A-Z]{2,}\()", r"\1 ", rest)
         return _ws(rest)
 
-    # Padrões de cabeçalho (colado ou separado), valores e códigos
-    HDR_COLADO   = re.compile(r"(\d{10,})\s*(\d{2}/\d{2}/\d{4})\s*(\d{2}:\d{2})")
-    HDR_SEPARADO = re.compile(r"(\d{6,})\s+(\d{6,})\s+(\d{2}/\d{2}/\d{4})\s*(\d{2}:\d{2})")
-    VAL_RE       = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")
-    CODE_RE      = re.compile(r"\d{3,6}-")  # "000000-Nome"
+    # Cabeçalho unificado: 1º número obrigatório, 2º opcional (NrGuia), depois Data e Hora
+    HDR_ANY = re.compile(r"(\d{6,})(?:\s+(\d{6,}))?\s*(\d{2}/\d{2}/\d{4})\s*(\d{2}:\d{2})")
+    VAL_RE  = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")
+    CODE_RE = re.compile(r"\d{3,6}-")
 
-    # ---------- 1) PRÉ-PROCESSAMENTO ----------
+    # ---------- 1) Pré-processamento ----------
     if not texto or not str(texto).strip():
         return pd.DataFrame(columns=TARGET_COLS)
 
-    s = _ws(texto)
-    s = _insert_spaces_patches(s)
-    s = _drop_header_and_total(s)
+    s = (texto or "").replace("\u00A0", " ")
+    s = _ILLEGAL_CTRL_RE.sub("", s)
 
+    # Normaliza escapes do SSRS (\-, \(, \)) → caracteres literais
+    s = s.replace(r"\-", "-").replace(r"\(", "(").replace(r"\)", ")")  # NEW
+
+    # PULO DO GATO: colagens críticas
+    s = re.sub(r"(\d{10,})(\d{2}/\d{2}/\d{4})", r"\1 \2", s)     # Atendimento+NrGuia ↔ Data (colado)
+    s = re.sub(r"(\d{2}/\d{2}/\d{4})(\d{2}:\d{2})", r"\1 \2", s) # Data ↔ Hora (colado)
+    s = re.sub(r"(\d{2}:\d{2})([A-ZÁ-Ú])", r"\1 \2", s)         # Hora ↔ Tipo (colado)
+    s = re.sub(r"(\))(\d{5,})", r"\1 \2", s)                    # ')' ↔ Matrícula (colado)
+    s = re.sub(r"(\d{5,})([A-ZÁ-Ú])", r"\1 \2", s)              # NEW: Matrícula ↔ Nome (colado)
+
+    s = _drop_header_and_total(s)
     if not s:
         return pd.DataFrame(columns=TARGET_COLS)
 
-    # ---------- 2) SEGMENTAÇÃO POR CABEÇALHO ----------
-    m_colado = list(HDR_COLADO.finditer(s))
-    m_sep    = list(HDR_SEPARADO.finditer(s))
-
-    matches = m_colado if len(m_colado) >= len(m_sep) else m_sep
-    use_colado = (matches is m_colado)
-    if not matches:
+    # ---------- 2) Cabeçalhos (streaming) ----------
+    heads = list(HDR_ANY.finditer(s))
+    if not heads:
+        # Tenta forçar espaço entre número e data, caso extremo
+        s2 = re.sub(r"(\d{6,})(\s*)(\d{2}/\d{2}/\d{4})", r"\1 \3", s)
+        heads = list(HDR_ANY.finditer(s2))
+        s = s2
+    if not heads:
         return pd.DataFrame(columns=TARGET_COLS)
 
-    # ---------- 3) VARREDURA DE SEGMENTOS + ÂNCORA PELO VALOR ----------
+    # ---------- 3) Varredura por segmentos + âncora pelo Valor ----------
     rows = []
-    for i, m in enumerate(matches):
+    for i, m in enumerate(heads):
         start = m.start()
-        end   = matches[i+1].start() if (i + 1) < len(matches) else len(s)
+        end   = heads[i+1].start() if (i + 1) < len(heads) else len(s)
         segment = s[start:end]
 
         vals = list(VAL_RE.finditer(segment))
         if not vals:
-            segment_ext = s[start:min(len(s), end + 160)]
+            segment_ext = s[start:min(len(s), end + 200)]
             vals = list(VAL_RE.finditer(segment_ext))
             if not vals:
                 continue
-            last_val   = vals[-1].group(0)
-            val_start  = vals[-1].start()
-            working    = segment_ext[:val_start].strip()
+            last_val  = vals[-1].group(0)
+            working   = segment_ext[:vals[-1].start()].strip()
         else:
-            last_val   = vals[-1].group(0)
-            val_start  = vals[-1].start()
-            working    = segment[:val_start].strip()
+            last_val  = vals[-1].group(0)
+            working   = segment[:vals[-1].start()].strip()
 
-        # ---------- 4) CABEÇALHO ----------
-        if use_colado:
-            digits_block, data, hora = m.groups()
-            if len(digits_block) <= 8:
-                atendimento = digits_block
-                nr_guia     = ""
+        # ---------- 4) Cabeçalho ----------
+        a_num, guia_num, data, hora = m.groups()
+        if guia_num and guia_num.strip():
+            atendimento = a_num
+            nr_guia     = guia_num
+        else:
+            if len(a_num) > 8:
+                atendimento = a_num[:-8]
+                nr_guia     = a_num[-8:]
             else:
-                atendimento = digits_block[:-8]
-                nr_guia     = digits_block[-8:]
-        else:
-            atendimento, nr_guia, data, hora = m.groups()
+                atendimento = a_num
+                nr_guia     = ""
 
-        # "resto" = tudo após a HORA (campos dinâmicos)
+        # "resto" = trecho após a HORA
         hpos = working.find(hora)
         if hpos == -1:
             continue
         rest = working[hpos + len(hora):].strip()
 
-        # Normalização agressiva do bloco dinâmico
         rest = _normalize_tipo_operadora(rest)
 
-        # ---------- 5) CREDENCIADO / PRESTADOR ----------
+        # ---------- 5) Credenciado / Prestador ----------
         codes = list(CODE_RE.finditer(rest))
         if len(codes) >= 2:
             i1, i2 = codes[-2].start(), codes[-1].start()
@@ -548,7 +525,7 @@ def parse_streaming_any(texto: str) -> pd.DataFrame:
             cred   = ""
             core   = rest
 
-        # ---------- 6) TIPO + OPERADORA + MATRÍCULA + BENEFICIÁRIO ----------
+        # ---------- 6) Tipo + Operadora + Matrícula + Beneficiário ----------
         toks = core.split()
         tipo, tail, _ = split_tipo_operadora(toks)
 
@@ -565,13 +542,12 @@ def parse_streaming_any(texto: str) -> pd.DataFrame:
         else:
             operadora = " ".join(tail[:idx_mat]).strip()
             k = idx_mat
-            mat_tokens = []
+            mats = []
             while k < len(tail) and is_mat_token(tail[k]):
-                mat_tokens.append(tail[k]); k += 1
-            matricula    = " ".join(mat_tokens).strip()
+                mats.append(tail[k]); k += 1
+            matricula    = " ".join(mats).strip()
             beneficiario = " ".join(tail[k:]).strip()
 
-        # ---------- 7) MONTA O REGISTRO ----------
         rows.append({
             "Atendimento":  atendimento,
             "NrGuia":       nr_guia,
@@ -586,7 +562,6 @@ def parse_streaming_any(texto: str) -> pd.DataFrame:
             "ValorTotal":   last_val,
         })
 
-    # ---------- 8) DATAFRAME + ORDENACÃO + SANITIZAÇÃO ----------
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=TARGET_COLS)
