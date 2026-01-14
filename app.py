@@ -24,73 +24,105 @@ def iniciar_driver():
     except:
         return webdriver.Chrome(options=options)
 
-st.title("🏥 Automação AMHP - Atendimentos")
+st.title("🏥 Gerador de Relatórios AMHP")
+
+# --- ENTRADA DE DADOS DO USUÁRIO ---
+col1, col2 = st.columns(2)
+with col1:
+    data_inicio = st.text_input("📅 Data Inicial", placeholder="DD/MM/AAAA")
+with col2:
+    data_fim = st.text_input("📅 Data Final", placeholder="DD/MM/AAAA")
 
 USUARIO = st.secrets["credentials"]["usuario"]
 SENHA = st.secrets["credentials"]["senha"]
 
-if st.button("🚀 Iniciar Relatório"):
-    driver = iniciar_driver()
-    if driver:
-        try:
-            with st.status("Iniciando processo...", expanded=True) as status:
-                
-                # 1. LOGIN E TRANSIÇÃO
-                st.write("🌐 Fazendo login no Portal...")
-                driver.get("https://portal.amhp.com.br/")
-                wait = WebDriverWait(driver, 30)
-                
-                wait.until(EC.presence_of_element_located((By.ID, "input-9"))).send_keys(USUARIO)
-                driver.find_element(By.ID, "input-12").send_keys(SENHA + Keys.ENTER)
+if st.button("🚀 Gerar Relatório"):
+    if not data_inicio or not data_fim:
+        st.error("Por favor, informe as datas inicial e final.")
+    else:
+        driver = iniciar_driver()
+        if driver:
+            try:
+                with st.status("Executando automação...", expanded=True) as status:
+                    
+                    # 1. LOGIN E NAVEGAÇÃO (Mantendo o que já funciona)
+                    st.write("🔐 Autenticando...")
+                    driver.get("https://portal.amhp.com.br/")
+                    wait = WebDriverWait(driver, 30)
+                    wait.until(EC.presence_of_element_located((By.ID, "input-9"))).send_keys(USUARIO)
+                    driver.find_element(By.ID, "input-12").send_keys(SENHA + Keys.ENTER)
+                    time.sleep(12) 
+                    
+                    st.write("🖱️ Acessando AMHPTISS...")
+                    botao_tiss = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'AMHPTISS')]")))
+                    driver.execute_script("arguments[0].click();", botao_tiss)
+                    time.sleep(8)
+                    if len(driver.window_handles) > 1:
+                        driver.switch_to.window(driver.window_handles[1])
 
-                time.sleep(12) 
-                
-                st.write("🖱️ Acessando AMHPTISS...")
-                botao_tiss = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'AMHPTISS')]")))
-                driver.execute_script("arguments[0].click();", botao_tiss)
-                
-                time.sleep(8)
-                if len(driver.window_handles) > 1:
-                    driver.switch_to.window(driver.window_handles[1])
+                    # Fechar informativo
+                    try:
+                        btn_fechar = WebDriverWait(driver, 7).until(EC.element_to_be_clickable((By.ID, "fechar-informativo")))
+                        driver.execute_script("arguments[0].click();", btn_fechar)
+                    except: pass
 
-                # 2. TRATAR INFORMATIVO
-                try:
-                    btn_fechar = WebDriverWait(driver, 7).until(EC.element_to_be_clickable((By.ID, "fechar-informativo")))
-                    driver.execute_script("arguments[0].click();", btn_fechar)
-                    st.write("✅ Informativo fechado.")
-                except:
-                    st.write("ℹ️ Sem informativo.")
+                    # 2. NAVEGAÇÃO ATÉ A TELA
+                    st.write("📂 Navegando para Atendimentos Realizados...")
+                    wait.until(EC.element_to_be_clickable((By.ID, "IrPara"))).click()
+                    time.sleep(1)
+                    wait.until(EC.element_to_be_clickable((By.XPATH, "//span[@class='rtIn' and contains(text(), 'Consultório')]"))).click()
+                    time.sleep(1)
+                    wait.until(EC.element_to_be_clickable((By.XPATH, "//a[@href='AtendimentosRealizados.aspx']"))).click()
+                    time.sleep(5)
 
-                # 3. NAVEGAÇÃO DETALHADA
-                st.write("📂 Navegando: Ir Para > Consultório > Atendimentos...")
+                    # 3. PREENCHIMENTO DOS FILTROS (Lógica Telerik)
+                    st.write("📝 Preenchendo filtros do relatório...")
 
-                # Passo A: Clicar em "Ir Para"
-                ir_para = wait.until(EC.element_to_be_clickable((By.ID, "IrPara")))
-                driver.execute_script("arguments[0].click();", ir_para)
-                time.sleep(2)
+                    # Filtro Negociação: Direto
+                    negocio = wait.until(EC.element_to_be_clickable((By.ID, "ctl00_MainContent_rcbTipoNegociacao_Input")))
+                    negocio.clear()
+                    negocio.send_keys("Direto")
+                    time.sleep(1)
+                    negocio.send_keys(Keys.ENTER)
 
-                # Passo B: Clicar em "Consultório" (Usando a classe rtIn que você passou)
-                consultorio = wait.until(EC.element_to_be_clickable((By.XPATH, "//span[@class='rtIn' and contains(text(), 'Consultório')]")))
-                driver.execute_script("arguments[0].click();", consultorio)
-                time.sleep(2)
+                    # Filtro Status: 300 - Pronto para Processamento
+                    status_campo = wait.until(EC.element_to_be_clickable((By.ID, "ctl00_MainContent_rcbStatus_Input")))
+                    status_campo.clear()
+                    status_campo.send_keys("300 - Pronto para Processamento")
+                    time.sleep(1)
+                    status_campo.send_keys(Keys.ENTER)
 
-                # Passo C: Clicar em "Atendimentos Realizados"
-                atendimentos = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[@href='AtendimentosRealizados.aspx']")))
-                driver.execute_script("arguments[0].click();", atendimentos)
-                
-                # 4. FINALIZAÇÃO
-                st.write("⏳ Carregando tela de relatório...")
-                time.sleep(7)
-                
-                st.success(f"📍 Chegamos! Página: {driver.title}")
-                driver.save_screenshot("tela_final.png")
-                st.image("tela_final.png", caption="Tela de Atendimentos Realizados")
+                    # Data Início
+                    st.write(f"📅 Definindo período: {data_inicio} até {data_fim}")
+                    dt_ini = driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataInicio_dateInput")
+                    dt_ini.clear()
+                    dt_ini.send_keys(data_inicio)
 
-                status.update(label="Navegação Concluída!", state="complete", expanded=False)
+                    # Data Fim
+                    dt_fim = driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataFim_dateInput")
+                    dt_fim.clear()
+                    dt_fim.send_keys(data_fim)
+                    time.sleep(1)
 
-        except Exception as e:
-            st.error(f"🚨 Erro na navegação: {e}")
-            driver.save_screenshot("erro_nav.png")
-            st.image("erro_nav.png")
-        finally:
-            driver.quit()
+                    # 4. BOTÃO BUSCAR
+                    st.write("🔍 Clicando em Buscar...")
+                    btn_buscar = driver.find_element(By.ID, "ctl00_MainContent_btnBuscar_input")
+                    driver.execute_script("arguments[0].click();", btn_buscar)
+                    
+                    # Espera a busca processar
+                    st.write("⏳ Processando busca...")
+                    time.sleep(8)
+
+                    # 5. VERIFICAÇÃO
+                    driver.save_screenshot("resultado_busca.png")
+                    st.image("resultado_busca.png", caption="Resultado da Busca")
+                    st.success("Busca finalizada! Verifique na imagem se os dados apareceram.")
+
+                    status.update(label="Busca concluída!", state="complete", expanded=False)
+
+            except Exception as e:
+                st.error(f"🚨 Erro: {e}")
+                driver.save_screenshot("erro_filtro.png")
+                st.image("erro_filtro.png")
+            finally:
+                driver.quit()
