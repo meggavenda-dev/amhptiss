@@ -8,7 +8,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 import time
 import os
-import shutil
+import re
 import io
 
 # --- CONFIGURAÇÃO ---
@@ -20,47 +20,50 @@ if 'db_consolidado' not in st.session_state:
 DOWNLOAD_TEMPORARIO = os.path.join(os.getcwd(), "temp_downloads")
 if not os.path.exists(DOWNLOAD_TEMPORARIO): os.makedirs(DOWNLOAD_TEMPORARIO)
 
-# --- PROCESSAMENTO ROBUSTO ---
+# --- FUNÇÃO DE LIMPEZA DE "LIXO" BINÁRIO ---
+def limpar_caracteres_invalidos(texto):
+    """Remove caracteres de controle e lixo binário que travam o Excel"""
+    if not isinstance(texto, str):
+        return texto
+    # Mantém apenas caracteres imprimíveis e acentuação básica
+    return re.sub(r'[^\x20-\x7E\xA0-\xFF\n\r\t]', '', texto)
 
 def processar_e_acumular(caminho_arquivo, status_nome, neg_nome):
     try:
-        # Tenta ler o arquivo com diferentes encodings caso o latin1 falhe
-        try:
-            with open(caminho_arquivo, 'r', encoding='latin1', errors='ignore') as f:
-                linhas = f.readlines()
-        except:
-            with open(caminho_arquivo, 'r', encoding='utf-8', errors='ignore') as f:
-                linhas = f.readlines()
+        # Lê o arquivo de forma binária e tenta decodificar limpando erros
+        with open(caminho_arquivo, 'rb') as f:
+            conteudo_binario = f.read()
         
-        # BUSCA DINÂMICA PELO CABEÇALHO
-        # Vamos procurar uma linha que tenha pelo menos 2 termos conhecidos
+        # Converte para texto ignorando o que for lixo binário
+        texto_limpo = conteudo_binario.decode('latin1', errors='ignore')
+        linhas = texto_limpo.splitlines()
+        
+        # Localiza o cabeçalho real
         indice_cabecalho = -1
-        termos_chave = ["Atendimento", "Guia", "Valor", "Beneficiário", "Realização"]
-        
         for i, linha in enumerate(linhas):
-            encontrados = [termo for termo in termos_chave if termo.lower() in linha.lower()]
-            if len(encontrados) >= 2: # Se achar pelo menos 2 termos, é o cabeçalho
+            if "Atendimento" in linha and "Guia" in linha:
                 indice_cabecalho = i
                 break
         
         if indice_cabecalho == -1:
-            # Se não achar, tenta pular as 16 linhas padrão do AMHP como última tentativa
-            indice_cabecalho = 16 
+            indice_cabecalho = 16 # Fallback para o padrão AMHP
 
-        # Carrega os dados
+        # Carrega no Pandas
         df = pd.read_csv(
-            io.StringIO("".join(linhas[indice_cabecalho:])), 
+            io.StringIO("\n".join(linhas[indice_cabecalho:])), 
             sep=',', 
             engine='python', 
             on_bad_lines='skip'
         )
         
-        # Limpeza de colunas vazias ou fantasmas
+        # LIMPEZA PROFUNDA
         df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
         df.columns = [c.strip() for c in df.columns]
-        df = df.dropna(how='all', axis=1).dropna(how='all', axis=0)
         
-        # Adiciona os filtros para saber a origem do dado
+        # Aplica a limpeza de caracteres ilegais em todas as células
+        for col in df.columns:
+            df[col] = df[col].apply(limpar_caracteres_invalidos)
+        
         df['Filtro_Status'] = status_nome
         df['Filtro_Negociacao'] = neg_nome
         
@@ -70,8 +73,7 @@ def processar_e_acumular(caminho_arquivo, status_nome, neg_nome):
         st.error(f"Erro no processamento: {e}")
         return False
 
-# --- NAVEGADOR ---
-
+# --- NAVEGADOR (HEADLESS) ---
 def iniciar_driver():
     options = Options()
     options.add_argument("--headless") 
@@ -83,8 +85,7 @@ def iniciar_driver():
     return webdriver.Chrome(options=options)
 
 # --- INTERFACE ---
-
-st.title("🏥 Consolidador de Relatórios AMHP")
+st.title("🏥 Consolidador AMHP (Versão Estável)")
 
 col1, col2 = st.columns(2)
 with col1: data_ini = st.date_input("Início", value=pd.to_datetime("2026-01-01"))
@@ -94,21 +95,21 @@ if st.button("🚀 Iniciar Captura"):
     driver = iniciar_driver()
     if driver:
         try:
-            with st.status("Robô trabalhando...", expanded=True) as s:
+            with st.status("Extraindo dados...", expanded=True) as s:
                 wait = WebDriverWait(driver, 35)
                 driver.get("https://portal.amhp.com.br/")
                 
-                # Login (Usa secrets do Streamlit)
+                # Login
                 wait.until(EC.presence_of_element_located((By.ID, "input-9"))).send_keys(st.secrets["credentials"]["usuario"])
                 driver.find_element(By.ID, "input-12").send_keys(st.secrets["credentials"]["senha"] + Keys.ENTER)
                 time.sleep(10)
                 
-                # Navegação TISS
+                # Acesso TISS
                 driver.execute_script("arguments[0].click();", wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'AMHPTISS')]"))))
                 time.sleep(8)
                 driver.switch_to.window(driver.window_handles[-1])
 
-                # Limpeza e Filtros
+                # Navegação
                 try: driver.execute_script("document.getElementById('fechar-informativo').click();")
                 except: pass
                 driver.execute_script("document.getElementById('IrPara').click();")
@@ -118,20 +119,10 @@ if st.button("🚀 Iniciar Captura"):
                 time.sleep(5)
 
                 # Preenchimento
-                def fill(id, v):
-                    el = driver.find_element(By.ID, id)
-                    driver.execute_script("arguments[0].value = arguments[1];", el, v)
-                    el.send_keys(Keys.ENTER)
-                    time.sleep(2)
+                driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataInicio_dateInput").send_keys(data_ini.strftime("%d/%m/%Y") + Keys.TAB)
+                driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataFim_dateInput").send_keys(data_fim.strftime("%d/%m/%Y") + Keys.TAB)
 
-                fill("ctl00_MainContent_rcbTipoNegociacao_Input", "Direto")
-                fill("ctl00_MainContent_rcbStatus_Input", "300 - Pronto para Processamento")
-                
-                d1, d2 = data_ini.strftime("%d/%m/%Y"), data_fim.strftime("%d/%m/%Y")
-                driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataInicio_dateInput").send_keys(d1 + Keys.TAB)
-                driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataFim_dateInput").send_keys(d2 + Keys.TAB)
-
-                # Exportação
+                # Buscar e Baixar
                 driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "ctl00_MainContent_btnBuscar_input"))
                 wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".rgMasterTable")))
                 driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "ctl00_MainContent_rdgAtendimentosRealizados_ctl00_ctl02_ctl00_SelectColumnSelectCheckBox"))
@@ -141,38 +132,41 @@ if st.button("🚀 Iniciar Captura"):
                 time.sleep(15)
                 if len(driver.find_elements(By.TAG_NAME, "iframe")) > 0: driver.switch_to.frame(0)
                 
-                dropdown = wait.until(EC.presence_of_element_located((By.ID, "ReportView_ReportToolbar_ExportGr_FormatList_DropDownList")))
-                Select(dropdown).select_by_value("XLS")
+                Select(wait.until(EC.presence_of_element_located((By.ID, "ReportView_ReportToolbar_ExportGr_FormatList_DropDownList")))).select_by_value("XLS")
                 time.sleep(2)
                 driver.execute_script("document.getElementById('ReportView_ReportToolbar_ExportGr_Export').click();")
                 
-                time.sleep(15) # Espera download
+                time.sleep(15) 
 
-                # Banco de Dados
+                # Processar
                 arquivos = [f for f in os.listdir(DOWNLOAD_TEMPORARIO) if f.endswith(('.xls', '.csv'))]
                 if arquivos:
                     recente = max([os.path.join(DOWNLOAD_TEMPORARIO, f) for f in arquivos], key=os.path.getctime)
                     processar_e_acumular(recente, "300", "Direto")
                     os.remove(recente)
-                    st.success("✅ Relatório adicionado ao banco!")
-                
-                s.update(label="Concluído!", state="complete")
+                    st.success("✅ Relatório carregado!")
+                s.update(label="Fim!", state="complete")
         except Exception as e:
             st.error(f"Erro: {e}")
         finally:
             driver.quit()
 
-# --- EXIBIÇÃO ---
+# --- ÁREA DE DOWNLOAD (BLINDADA) ---
 if not st.session_state.db_consolidado.empty:
     st.divider()
-    st.subheader("📊 Base de Dados Consolidada")
+    st.subheader("📊 Base Consolidada")
     st.dataframe(st.session_state.db_consolidado)
     
-    # Exportação para Excel
-    buffer = io.BytesIO()
-    st.session_state.db_consolidado.to_excel(buffer, index=False, engine='openpyxl')
-    st.download_button("💾 Baixar Relatório Unificado (.xlsx)", buffer.getvalue(), "relatorio_final.xlsx")
+    # Exportamos para CSV com codificação Excel (utf-8-sig) para evitar o erro de caracteres ilegais do XLSX
+    csv_data = st.session_state.db_consolidado.to_csv(index=False, sep=';', encoding='utf-8-sig').encode('utf-8-sig')
     
-    if st.button("🗑️ Limpar Tudo"):
+    st.download_button(
+        label="💾 Baixar Relatório (Abrir no Excel)",
+        data=csv_data,
+        file_name="relatorio_consolidado.csv",
+        mime="text/csv"
+    )
+    
+    if st.button("🗑️ Limpar Banco"):
         st.session_state.db_consolidado = pd.DataFrame()
         st.rerun()
