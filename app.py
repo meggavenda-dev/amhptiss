@@ -125,7 +125,7 @@ def js_safe_click(driver, by, value, timeout=30):
     el = WebDriverWait(driver, timeout).until(
         EC.presence_of_element_located((by, value))
     )
-    driver.execute_script("arguments[0].click();", el)
+    safe_click(driver, By.ID, "ctl00_MainContent_rdgAtendimentosRealizados_ctl00_ctl02_ctl00_SelectColumnSelectCheckBox")
     time.sleep(0.5)  # pequeno delay para garantir o click
 
 # ========= Parser PDF =========
