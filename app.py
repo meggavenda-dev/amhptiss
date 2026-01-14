@@ -136,7 +136,8 @@ def ensure_atendimentos_schema(df: pd.DataFrame) -> pd.DataFrame:
 
 # ========= Regex e Parser de TEXTO (ReportViewer) =========
 val_re        = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")  # valor pt-BR
-head_re       = re.compile(r"(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+(.*)")
+# FLEXÍVEL: aceita data e hora coladas e não exige espaço após a hora
+head_re       = re.compile(r"(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s*(\d{2}:\d{2})(.*)")
 code_start_re = re.compile(r"\d{3,6}-")
 re_total_blk  = re.compile(r"total\s*r\$\s*\d{1,3}(?:\.\d{3})*,\d{2}", re.I)
 
@@ -300,10 +301,9 @@ def parse_relatorio_text_to_atendimentos_df(texto: str) -> pd.DataFrame:
         end   = heads[idx+1].start() if (idx + 1) < len(heads) else len(big)
         segment = big[start:end].strip()
 
-        # Pega o último valor dentro do segmento
+        # Pega o último valor dentro do segmento; se não achar, estende um pouco após
         vals = list(val_re.finditer(segment))
         if not vals:
-            # Estende um pouco após o segmento (pega valor colado logo depois)
             ext_end = min(len(big), end + max(200, int(0.1 * len(segment))))
             segment_ext = big[start:ext_end]
             vals = list(val_re.finditer(segment_ext))
@@ -469,7 +469,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
     val_line_re         = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}$")
     code_start_re_local = re.compile(r"\d{3,6}-")
     re_total_blk_local  = re.compile(r"total\s*r\$\s*\d{1,3}(?:\.\d{3})*,\d{2}", re.I)
-    head_re_local       = re.compile(r"(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+(.*)")
+    head_re_local       = re.compile(r"(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s*(\d{2}:\d{2})(.*)")
 
     def _normalize_ws_local(s: str) -> str:
         return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip()
@@ -487,11 +487,11 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                     if not words:
                         continue
 
-                    # Cabeçalho
+                    # Cabeçalho: localizar banda com "Atendimento" e "Valor Total"
                     header_y = None
                     header_words = []
                     for w in words:
-                        if "Atendimento" in w["text"]]:
+                        if "Atendimento" in w["text"]:
                             y_top = w["top"]
                             band = [ww for ww in words if abs(ww["top"] - y_top) <= TOP_TOL]
                             band_text = " ".join([b["text"] for b in band])
@@ -1029,3 +1029,4 @@ if not st.session_state.db_consolidado.empty:
     if st.button("🗑️ Limpar Banco Temporário"):
         st.session_state.db_consolidado = pd.DataFrame()
         st.rerun()
+
