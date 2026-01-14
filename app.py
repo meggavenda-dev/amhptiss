@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-import os, io, re, time, shutil
+import os
+import time
 import streamlit as st
 import pandas as pd
 
@@ -10,27 +11,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
-from selenium.common.exceptions import TimeoutException
-
-def sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Limpeza defensiva para exibição/exportação:
-    - converte tudo para string
-    - remove caracteres problemáticos
-    """
-    if df is None or df.empty:
-        return df
-
-    df = df.copy()
-    for col in df.columns:
-        df[col] = (
-            df[col]
-            .astype(str)
-            .str.replace("\n", " ", regex=False)
-            .str.replace("\r", " ", regex=False)
-            .str.strip()
-        )
-    return df
 
 # ========= Secrets/env =========
 try:
@@ -44,11 +24,20 @@ except Exception:
     pass
 
 # ========= Página =========
-st.set_page_config(page_title="AMHP - Exportador PDF + Consolidação", layout="wide")
-st.title("🏥 Exportador AMHP (PDF) + Consolidador")
+st.set_page_config(page_title="AMHP - Exportador PDF", layout="wide")
+st.title("🏥 Exportador AMHP (PDF)")
 
+# ========= Estado =========
 if "db_consolidado" not in st.session_state:
     st.session_state.db_consolidado = pd.DataFrame()
+
+# ========= Utils =========
+def sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Placeholder seguro para evitar NameError"""
+    return df.copy()
+
+def calcular_total_passos(negociacoes, status_list):
+    return max(1, len(negociacoes) * len(status_list))
 
 # ========= Paths =========
 def obter_caminho_final():
@@ -92,8 +81,8 @@ with st.sidebar:
         default=["300 - Pronto para Processamento"]
     )
 
-    wait_time_main = st.number_input("⏱️ Espera navegação", 0, 60, 10)
-    wait_time_download = st.number_input("⏱️ Espera download", 10, 60, 18)
+    wait_time_main = st.number_input("⏱️ Espera navegação (s)", 0, 60, 10)
+    wait_time_download = st.number_input("⏱️ Espera download (s)", 10, 60, 18)
 
 # ========= Selenium =========
 def configurar_driver():
@@ -124,12 +113,21 @@ def safe_click(driver, locator, timeout=30):
 
 # ========= Botão Principal =========
 if st.button("🚀 Iniciar Processo (PDF)"):
+
+    progress_bar = st.progress(0)
+    status_box = st.empty()
+
     driver = configurar_driver()
+
     try:
         wait = WebDriverWait(driver, 40)
 
-        # Login
+        total_passos = calcular_total_passos(negociacoes, status_list)
+        passo_atual = 0
+
+        status_box.info("🔐 Realizando login no portal AMHP...")
         driver.get("https://portal.amhp.com.br/")
+
         wait.until(
             EC.presence_of_element_located((By.ID, "input-9"))
         ).send_keys(st.secrets["credentials"]["usuario"])
@@ -140,7 +138,7 @@ if st.button("🚀 Iniciar Processo (PDF)"):
 
         time.sleep(wait_time_main)
 
-        # Acessa TISS
+        status_box.info("🧭 Acessando módulo AMHPTISS...")
         btn_tiss = wait.until(
             EC.element_to_be_clickable(
                 (By.XPATH, "//button[contains(., 'AMHPTISS')]")
@@ -152,7 +150,7 @@ if st.button("🚀 Iniciar Processo (PDF)"):
         if len(driver.window_handles) > 1:
             driver.switch_to.window(driver.window_handles[-1])
 
-        # Navegação
+        status_box.info("📂 Navegando para Atendimentos Realizados...")
         driver.execute_script("document.getElementById('IrPara').click();")
         time.sleep(2)
         safe_click(driver, (By.XPATH, "//span[normalize-space()='Consultório']"))
@@ -163,11 +161,14 @@ if st.button("🚀 Iniciar Processo (PDF)"):
         for negociacao in negociacoes:
             for status_sel in status_list:
 
-                st.write(
-                    f"📝 Filtros → Negociação: **{negociacao}**, "
-                    f"Status: **{status_sel}**, "
-                    f"Período: **{data_ini}–{data_fim}**"
+                passo_atual += 1
+                percentual = int((passo_atual / total_passos) * 100)
+
+                status_box.info(
+                    f"🔄 {passo_atual}/{total_passos} | "
+                    f"Negociação: {negociacao} | Status: {status_sel}"
                 )
+                progress_bar.progress(percentual)
 
                 # Negociação
                 neg_input = wait.until(
@@ -176,9 +177,7 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                     )
                 )
                 neg_input.click()
-                neg_input.send_keys(Keys.CONTROL, "a")
-                neg_input.send_keys(Keys.BACKSPACE)
-                neg_input.send_keys(negociacao)
+                neg_input.send_keys(Keys.CONTROL, "a", Keys.BACKSPACE, negociacao)
                 time.sleep(0.5)
                 neg_input.send_keys(Keys.ENTER)
 
@@ -189,9 +188,7 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                     )
                 )
                 stat_input.click()
-                stat_input.send_keys(Keys.CONTROL, "a")
-                stat_input.send_keys(Keys.BACKSPACE)
-                stat_input.send_keys(status_sel)
+                stat_input.send_keys(Keys.CONTROL, "a", Keys.BACKSPACE, status_sel)
                 stat_input.send_keys(Keys.ENTER)
 
                 # Datas
@@ -251,26 +248,15 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                 time.sleep(wait_time_download)
                 driver.switch_to.default_content()
 
-        st.success("✅ Processo concluído com sucesso!")
+        progress_bar.progress(100)
+        status_box.success("🎯 Automação finalizada com sucesso!")
+        st.success("✅ Processo concluído!")
 
     except Exception as e:
-        st.error(f"Erro: {e}")
+        st.error(f"❌ Erro durante a automação: {e}")
+
     finally:
         try:
             driver.quit()
         except Exception:
             pass
-
-# ========= Resultados & Export =========
-if not st.session_state.db_consolidado.empty:
-    st.divider()
-    df_preview = sanitize_df(st.session_state.db_consolidado)
-    st.subheader("📊 Base consolidada (temporária)")
-    st.dataframe(df_preview, use_container_width=True)
-
-    csv_bytes = df_preview.to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button("💾 Baixar Consolidação (CSV)", csv_bytes, file_name="consolidado_amhp.csv", mime="text/csv")
-
-    if st.button("🗑️ Limpar Banco Temporário"):
-        st.session_state.db_consolidado = pd.DataFrame()
-        st.rerun()
