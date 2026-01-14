@@ -120,10 +120,6 @@ SYNONYMS = {
 }
 
 def ensure_atendimentos_schema(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Garante as 11 colunas da Tabela — Atendimentos.
-    Renomeia sinônimos, cria colunas faltantes e reordena.
-    """
     if df is None or df.empty:
         return pd.DataFrame(columns=TARGET_COLS)
     rename_map = {}
@@ -148,7 +144,7 @@ def _normalize_ws2(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").replace("\u00A0", " ")).strip()
 
 def is_mat_token(t: str) -> bool:
-    """Heurística de 'Matrícula': números ou alfanum com 5+ chars (cobre casos com X)."""
+    # Matrícula: números ou alfanum com 5+ chars (cobre casos com X)
     if re.fullmatch(r"\d{5,}", t):
         return True
     return bool(re.fullmatch(r"[0-9A-Z]{5,}", t))
@@ -337,6 +333,76 @@ def safe_click(driver, locator, timeout=30):
         driver.execute_script("arguments[0].click();", el)
         return el
 
+# ========= Captura robusta de TEXTO no ReportViewer =========
+def capture_report_text(driver):
+    """
+    Tenta extrair texto do ReportViewer em diferentes renderizações SSRS.
+    Retorna (texto, origem) para debug.
+    """
+    # 1) Container padrão do SSRS moderno
+    try:
+        el = driver.find_element(By.ID, "VisibleReportContent")
+        txt = el.text.strip()
+        if len(txt) > 50:
+            return txt, "#VisibleReportContent.text"
+        # textContent via JS (pega textos invisíveis por CSS)
+        txt2 = driver.execute_script("return arguments[0].textContent;", el) or ""
+        txt2 = txt2.strip()
+        if len(txt2) > 50:
+            return txt2, "#VisibleReportContent.textContent"
+    except Exception:
+        pass
+
+    # 2) Containers típicos
+    for sel in [".doc", ".FixedTable", ".FixedDocument", "div[aria-label='Relatório']"]:
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, sel)
+            txt = el.text.strip()
+            if len(txt) > 50:
+                return txt, f"{sel}.text"
+            txt2 = driver.execute_script("return arguments[0].textContent;", el) or ""
+            txt2 = txt2.strip()
+            if len(txt2) > 50:
+                return txt2, f"{sel}.textContent"
+        except Exception:
+            continue
+
+    # 3) Concatena todas as células em containers conhecidos
+    try:
+        cells = driver.find_elements(By.CSS_SELECTOR, ".FixedTable *")
+        if not cells:
+            cells = driver.find_elements(By.CSS_SELECTOR, ".doc *")
+        parts = []
+        for c in cells:
+            t = (c.text or "").strip()
+            if t:
+                parts.append(t)
+        if parts:
+            txt = " ".join(parts)
+            if len(txt) > 50:
+                return txt, "FixedTable/doc cells join"
+    except Exception:
+        pass
+
+    # 4) Fallbacks do body
+    try:
+        txt = driver.execute_script("return document.body.innerText;") or ""
+        txt = txt.strip()
+        if len(txt) > 50:
+            return txt, "document.body.innerText"
+    except Exception:
+        pass
+
+    try:
+        txt2 = driver.execute_script("return document.body.textContent;") or ""
+        txt2 = txt2.strip()
+        if len(txt2) > 50:
+            return txt2, "document.body.textContent"
+    except Exception:
+        pass
+
+    return "", "no-text (image/canvas rendering)"
+
 # ========= PDF → Tabela (coordenadas + textual reforçado) =========
 def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool = False) -> pd.DataFrame:
     """
@@ -351,7 +417,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
     MERGE_GAP_X  = 10.0
     COL_MARGIN   = 4.0
 
-    # Regex comuns
+    # Regex comuns (locais ao parser PDF)
     val_re_local        = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")
     val_line_re         = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}$")
     code_start_re_local = re.compile(r"\d{3,6}-")
@@ -517,7 +583,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                 pass
         return ensure_atendimentos_schema(out)
 
-    # ---------- Texto (fallback) ----------
+    # ---------- Texto (fallback textual reforçado) ----------
     def parse_by_text() -> pd.DataFrame:
         try:
             reader = PdfReader(open(pdf_path, "rb"))
@@ -573,7 +639,6 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                 atendimento, nr_guia, realizacao, hora, rest = m_head.groups()
 
                 toks = rest.split()
-                # simplificada
                 idx_mat = None
                 for j, t in enumerate(toks):
                     if re.fullmatch(r"\d+", t):
@@ -683,6 +748,20 @@ with st.expander("🧪 Colar TEXTO do relatório (sem automação)", expanded=Fa
                 st.session_state.db_consolidado = pd.concat([st.session_state.db_consolidado, df_txt], ignore_index=True)
                 st.success(f"✅ Adicionado à consolidação. Registros acumulados: {len(st.session_state.db_consolidado)}")
 
+# ========= (Opcional) Processar PDF manualmente =========
+with st.expander("🧪 Testar parser com upload de PDF (sem automação)", expanded=False):
+    up = st.file_uploader("Envie um PDF do AMHPTISS para teste", type=["pdf"])
+    if up and st.button("Processar PDF (teste)"):
+        tmp_pdf = os.path.join(DOWNLOAD_TEMPORARIO, "teste_upload.pdf")
+        with open(tmp_pdf, "wb") as f:
+            f.write(up.getvalue())
+        df_test = parse_pdf_to_atendimentos_df(tmp_pdf, mode="text", debug=debug_parser)
+        if df_test.empty:
+            st.error("Parser não conseguiu extrair linhas deste PDF usando o modo textual.")
+        else:
+            st.success(f"{len(df_test)} linha(s) extraída(s) pelo modo textual.")
+            st.dataframe(df_test, use_container_width=True)
+
 # ========= Botão principal =========
 if st.button("🚀 Iniciar Processo"):
     driver = configurar_driver()
@@ -758,15 +837,11 @@ if st.button("🚀 Iniciar Processo"):
                     driver.switch_to.frame(0)
 
                 if extraction_mode.startswith("Texto"):
-                    # ====== NOVO: Captura TEXTO direto do ReportViewer ======
+                    # ====== Captura TEXTO direto do ReportViewer ======
                     st.write("🧾 Capturando TEXTO do relatório no ReportViewer...")
-                    try:
-                        # Dá um pequeno tempo para render do SSRS
-                        time.sleep(2)
-                        # Captura texto do body (cobre a maioria dos viewers)
-                        texto_relatorio = driver.find_element(By.TAG_NAME, "body").text
-                    except Exception:
-                        texto_relatorio = ""
+                    time.sleep(2)  # pequeno tempo para render do SSRS
+                    texto_relatorio, origem = capture_report_text(driver)
+                    st.caption(f"Origem do texto capturado: **{origem}**")
 
                     if not texto_relatorio.strip():
                         st.warning("Não consegui capturar o texto do relatório automaticamente. Tente novamente ou use o expander 'Colar TEXTO'.")
@@ -808,7 +883,7 @@ if st.button("🚀 Iniciar Processo"):
                 else:
                     # ====== Fluxo legado: Exportar PDF ======
                     dropdown = wait.until(EC.presence_of_element_located((By.ID, "ReportView_ReportToolbar_ExportGr_FormatList_DropDownList")))
-                    Select(dropdown).select_by_value("PDF")
+                    Select(dropdown).select_by_value("PDF")  # Se quiser CSV: "CSV"
                     time.sleep(2)
                     export_btn = driver.find_element(By.ID, "ReportView_ReportToolbar_ExportGr_Export")
                     driver.execute_script("arguments[0].click();", export_btn)
