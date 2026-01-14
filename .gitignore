@@ -1,11 +1,6 @@
 
-# Python
 __pycache__/
 *.pyc
-
-# Streamlit secrets
 .streamlit/secrets.toml
-
-# Relatórios gerados localmente (se não quiser versionar)
-# comente se preferir manter histórico no Git
+# Descomente para não versionar relatórios:
 # reports/
