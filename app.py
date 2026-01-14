@@ -214,29 +214,6 @@ with st.sidebar:
     wait_time_main = st.number_input("⏱️ Espera navegação", 0, 60, 10)
     wait_time_download = st.number_input("⏱️ Espera download", 10, 60, 18)
 
-# ========= Execução =========
-if st.button("🚀 Iniciar Processo (PDF)"):
-    driver = configurar_driver()
-    try:
-        wait = WebDriverWait(driver, 40)
-        driver.get("https://portal.amhp.com.br/")
-        wait.until(EC.presence_of_element_located((By.ID, "input-9"))).send_keys(st.secrets["credentials"]["usuario"])
-        driver.find_element(By.ID, "input-12").send_keys(st.secrets["credentials"]["senha"] + Keys.ENTER)
-        time.sleep(wait_time_main)
-
-        btn_tiss = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'AMHPTISS')]")))
-        driver.execute_script("arguments[0].click();", btn_tiss)
-        time.sleep(wait_time_main)
-
-        if len(driver.window_handles) > 1:
-            driver.switch_to.window(driver.window_handles[-1])
-
-        st.success("Automação iniciada.")
-finally:
-    try:
-        driver.quit()
-    except Exception:
-        pass
 
 # ========= PDF → Tabela =========
 def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "text", debug: bool = False) -> pd.DataFrame:
