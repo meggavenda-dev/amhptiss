@@ -9,12 +9,18 @@ Requisitos (no ambiente):
 - selenium
 - xlrd==2.0.1 (para .xls BIFF)
 - xlsxwriter (para exportar .xlsx)
-- openpyxl (somente para leitura .xlsx caso AMHP exporte EXCELOPENXML)
-- chromium + chromium-driver (no Streamlit Cloud via packages.txt)
+- openpyxl (somente para ler .xlsx caso AMHP exporte EXCELOPENXML)
+- (Cloud) chromium + chromium-driver + libs
 
-Se usar Streamlit Cloud:
-- Defina env vars: CHROME_BINARY=/usr/bin/chromium, CHROMEDRIVER_BINARY=/usr/bin/chromedriver
-- Adicione 'chromium' e 'chromium-driver' no packages.txt
+Secrets (Streamlit):
+[credentials]
+usuario = "SEU_LOGIN_NO_AMHP"
+senha   = "SUA_SENHA_NO_AMHP"
+
+Opcional (Cloud):
+[env]
+CHROME_BINARY = "/usr/bin/chromium"
+CHROMEDRIVER_BINARY = "/usr/bin/chromedriver"
 """
 
 import os
@@ -41,30 +47,41 @@ from selenium.common.exceptions import (
 )
 
 # =========================================================
-# CONFIGURAÇÃO DA PÁGINA
+# Secrets -> env (Cloud-friendly)
+# =========================================================
+try:
+    chrome_bin_secret = st.secrets.get("env", {}).get("CHROME_BINARY", None)
+    driver_bin_secret = st.secrets.get("env", {}).get("CHROMEDRIVER_BINARY", None)
+    if chrome_bin_secret:
+        os.environ["CHROME_BINARY"] = chrome_bin_secret
+    if driver_bin_secret:
+        os.environ["CHROMEDRIVER_BINARY"] = driver_bin_secret
+except Exception:
+    pass  # Execução local sem secrets de env
+
+# =========================================================
+# Configuração da Página
 # =========================================================
 st.set_page_config(page_title="AMHP Data Analytics", layout="wide")
 st.title("🏥 Consolidador de Relatórios AMHP")
 
-# Inicialização do Banco de Dados na Sessão
+# Banco em sessão
 if "db_consolidado" not in st.session_state:
     st.session_state.db_consolidado = pd.DataFrame()
 
-# Diretório Temporário para Downloads
+# Diretório temporário
 DOWNLOAD_DIR = os.path.join(os.getcwd(), "temp_downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # =========================================================
-# SANITIZAÇÃO ROBUSTA (PATCH)
-# Remove caracteres de controle ilegais para Excel/XML,
-# preservando números/datas e garantindo unicidade de colunas.
+# Sanitização robusta (remove caracteres de controle ilegais)
 # =========================================================
 _ILLEGAL_CTRL_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
 
 def _sanitize_text_for_excel(s: str) -> str:
     s = s.replace("\x00", "")
     s = _ILLEGAL_CTRL_RE.sub("", s)
-    # Converte NBSP para espaço comum
+    # Normaliza NBSP (char comum em SSRS) para espaço comum
     s = s.replace("\u00A0", " ").strip()
     return s
 
@@ -72,22 +89,19 @@ def sanitize_value_for_excel(v):
     if pd.isna(v):
         return v
     if isinstance(v, (bytes, bytearray)):
-        # Tenta decodificar dados binários que vieram do relatório
         try:
             v = v.decode("utf-8", "ignore")
         except Exception:
             v = v.decode("latin-1", "ignore")
     if isinstance(v, str):
         return _sanitize_text_for_excel(v)
-    # Números/datas permanecem iguais
-    return v
+    return v  # números/datas ficam intactos
 
 def sanitize_df_for_excel(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # 1) Sanitiza nomes de colunas e garante unicidade
-    new_cols = []
-    seen = {}
+    # 1) Nomes de colunas saneados + unicidade
+    new_cols, seen = [], {}
     for c in df.columns:
         c2 = sanitize_value_for_excel(str(c))
         base = c2
@@ -96,7 +110,7 @@ def sanitize_df_for_excel(df: pd.DataFrame) -> pd.DataFrame:
         new_cols.append(base if n == 1 else f"{base}_{n}")
     df.columns = new_cols
 
-    # 2) Sanitiza apenas colunas de texto (object)
+    # 2) Sanitiza apenas colunas de texto
     obj_cols = df.select_dtypes(include=["object"]).columns
     for col in obj_cols:
         df[col] = df[col].apply(sanitize_value_for_excel)
@@ -104,92 +118,82 @@ def sanitize_df_for_excel(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def find_illegal_chars_rows(df: pd.DataFrame):
-    """Ajuda a identificar colunas/linhas com caracteres ilegais (para debug)."""
+    """Diagnóstico (opcional) de linhas com caracteres de controle ilegais."""
     rows = []
     for col in df.select_dtypes(include=["object"]).columns:
-        s = df[col].dropna().astype(str)
+        s = df[col].astype(str)
         bad = s.str.contains(_ILLEGAL_CTRL_RE, regex=True)
         if bad.any():
-            rows.append((col, df[bad.index[bad]].index.tolist()[:20]))
+            idxs = s[bad].index.tolist()[:20]
+            rows.append((col, idxs))
     return rows
 
 # =========================================================
-# FUNÇÃO DE PROCESSAMENTO XLS (LEGACY BIFF8) + FALLBACKS
-# Lê arquivos .xls do AMHP; tenta tratar .xls disfarçado (HTML/CSV)
+# Processamento de .xls (BIFF8) + fallbacks (HTML/CSV disfarçado)
 # =========================================================
 def processar_xls_amhp(caminho_arquivo, status_nome, neg_nome):
-    """Lê arquivos XLS binários (BIFF8) gerados pelo AMHP usando xlrd com fallbacks."""
+    """Lê arquivos XLS binários gerados pelo AMHP usando xlrd com fallbacks."""
     try:
         import xlrd
 
-        # Tenta abrir como BIFF8
+        # Tenta BIFF8
         try:
             workbook = xlrd.open_workbook(caminho_arquivo)
             sheet = workbook.sheet_by_index(0)
-
-            dados_brutos = []
-            for row_idx in range(sheet.nrows):
-                # sheet.row_values devolve tipos nativos (floats/strings)
-                dados_brutos.append(sheet.row_values(row_idx))
-
+            dados_brutos = [sheet.row_values(row_idx) for row_idx in range(sheet.nrows)]
             df_temp = pd.DataFrame(dados_brutos)
 
         except Exception:
-            # Fallback 1: .xls que é HTML
+            # Header do arquivo para detectar HTML
             with open(caminho_arquivo, "rb") as f:
                 head = f.read(4096)
             prefix = head[:64].decode("latin-1", "ignore").lower()
 
             if "<html" in prefix or "<table" in prefix:
-                # Tenta ler a(s) tabela(s) HTML
+                # HTML (SSRS às vezes exporta .xls com HTML)
                 try:
                     tables = pd.read_html(caminho_arquivo, header=None)
                     df_temp = tables[0]
                 except Exception:
-                    # Se read_html falhar, tenta ler como CSV disfarçado
+                    # CSV disfarçado
                     try:
                         df_temp = pd.read_csv(caminho_arquivo, sep=";", header=None, encoding="latin-1")
                     except Exception:
                         df_temp = pd.read_csv(caminho_arquivo, sep=",", header=None, encoding="latin-1")
             else:
-                # Fallback 2: CSV mascarado como .xls
+                # CSV disfarçado
                 try:
                     df_temp = pd.read_csv(caminho_arquivo, sep=";", header=None, encoding="latin-1")
                 except Exception:
                     df_temp = pd.read_csv(caminho_arquivo, sep=",", header=None, encoding="latin-1")
 
-        # Localiza dinamicamente a linha do cabeçalho
+        # Localiza dinamicamente o cabeçalho (linha que contém "Atendimento" e "Guia")
         indice_cabecalho = -1
         for i, linha in df_temp.iterrows():
-            # Normaliza NBSP para espaço
             linha_str = " ".join([str(v).replace("\u00A0", " ") for v in linha.values])
             if "Atendimento" in linha_str and "Guia" in linha_str:
                 indice_cabecalho = i
                 break
-
         if indice_cabecalho == -1:
-            # Se não achar, tenta a primeira linha como cabeçalho
-            indice_cabecalho = 0
+            indice_cabecalho = 0  # fallback
 
         # Define cabeçalhos e remove lixo
         df = df_temp.iloc[indice_cabecalho + 1:].copy()
         df.columns = df_temp.iloc[indice_cabecalho].astype(str).tolist()
-
-        # Limpa colunas e linhas vazias
         df = df.loc[:, df.columns.notnull()]
         df = df.dropna(how="all", axis=1).dropna(how="all", axis=0)
 
-        # 🔧 PATCH: Sanitiza DF para Excel (sem destruir tipos)
+        # Sanitização
         df = sanitize_df_for_excel(df)
 
-        # Adiciona Metadados
+        # Metadados
         df["Filtro_Status"] = sanitize_value_for_excel(status_nome)
         df["Filtro_Negociacao"] = sanitize_value_for_excel(neg_nome)
 
-        # Concatena ao banco global
+        # Concatena ao banco
         st.session_state.db_consolidado = pd.concat([st.session_state.db_consolidado, df], ignore_index=True)
 
-        # Opcional: mostrar diagnóstico de caracteres ilegais (se houver)
+        # Opcional: diagnóstico
         offenders = find_illegal_chars_rows(st.session_state.db_consolidado)
         if offenders:
             with st.expander("🚨 Linhas com caracteres ilegais (amostra)", expanded=False):
@@ -203,7 +207,7 @@ def processar_xls_amhp(caminho_arquivo, status_nome, neg_nome):
         return False
 
 # =========================================================
-# HELPERS SELENIUM (espera/cliqueresiliente/janelas/iframes/debug)
+# Helpers Selenium (espera/cliqueresiliente/janelas/iframes/debug)
 # =========================================================
 def wait_visible(driver, locator, timeout=30):
     return WebDriverWait(driver, timeout).until(EC.visibility_of_element_located(locator))
@@ -212,9 +216,7 @@ def wait_clickable(driver, locator, timeout=30):
     return WebDriverWait(driver, timeout).until(EC.element_to_be_clickable(locator))
 
 def safe_click(driver, locator, timeout=30):
-    """
-    Tenta clique normal; se interceptado, força clique via JS.
-    """
+    """Tenta clique normal; se interceptado, força via JS."""
     try:
         el = wait_clickable(driver, locator, timeout)
         el.click()
@@ -225,34 +227,26 @@ def safe_click(driver, locator, timeout=30):
         return el
 
 def wait_new_window_and_switch(driver, prev_handles, timeout=30):
-    """
-    Espera abrir nova janela/aba e faz switch com segurança.
-    """
+    """Espera nova janela/aba e faz switch com segurança."""
     WebDriverWait(driver, timeout).until(lambda d: len(d.window_handles) > len(prev_handles))
     new_handle = (set(driver.window_handles) - set(prev_handles)).pop()
     driver.switch_to.window(new_handle)
     return new_handle
 
 def switch_to_iframe_safe(driver, timeout=20, iframe_locator=None, index_fallback=0):
-    """
-    Tenta localizar iframe por locator (ID/CSS); se não achar, tenta por índice.
-    """
+    """Tenta localizar iframe por locator (ID/CSS) e cai por índice se necessário."""
     try:
         if iframe_locator:
             iframe_el = WebDriverWait(driver, timeout).until(EC.presence_of_element_located(iframe_locator))
             driver.switch_to.frame(iframe_el)
         else:
-            # Fallback por índice
             WebDriverWait(driver, timeout).until(lambda d: len(d.find_elements(By.TAG_NAME, "iframe")) > index_fallback)
             driver.switch_to.frame(index_fallback)
     except TimeoutException:
-        # Se não tiver iframe, permanece na página
-        pass
+        pass  # se não tiver iframe, segue na página atual
 
 def capture_debug(driver, label="falha"):
-    """
-    Salva screenshot e page source para ajudar o debug, exibe no Streamlit.
-    """
+    """Salva screenshot e page source para auxiliar debug."""
     try:
         img_path = os.path.join(DOWNLOAD_DIR, f"debug_{label}.png")
         html_path = os.path.join(DOWNLOAD_DIR, f"debug_{label}.html")
@@ -267,8 +261,6 @@ def capture_debug(driver, label="falha"):
             pass
     except Exception as e:
         st.warning(f"Não foi possível salvar debug: {e}")
-
-    # Logs do navegador (se disponíveis)
     try:
         logs = driver.get_log("browser")
         if logs:
@@ -278,24 +270,24 @@ def capture_debug(driver, label="falha"):
         pass
 
 # =========================================================
-# CONFIGURAÇÃO DO NAVEGADOR (SELENIUM ROBUSTO)
+# Configuração do Navegador (Selenium robusto)
 # =========================================================
 def configurar_driver():
     opts = Options()
 
-    # Usa path do Chromium/Chromedriver (bom para Streamlit Cloud)
+    # Paths (Cloud/local) via env
     chrome_binary = os.environ.get("CHROME_BINARY", "/usr/bin/chromium")
     driver_binary = os.environ.get("CHROMEDRIVER_BINARY", "/usr/bin/chromedriver")
     if os.path.exists(chrome_binary):
         opts.binary_location = chrome_binary
 
-    # Headless: mais compatível com builds de Cloud
+    # Headless estável
     opts.add_argument("--headless")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1920,1080")
 
-    # Stealth básico (evita bloqueio por detecção de automation)
+    # Stealth básico
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_argument("--disable-blink-features=AutomationControlled")
@@ -313,35 +305,51 @@ def configurar_driver():
     }
     opts.add_experimental_option("prefs", prefs)
 
-    # Usa Service com caminho explícito se existir (evita mismatch)
+    # Service explícito, se existir
     if os.path.exists(driver_binary):
         service = Service(executable_path=driver_binary)
         driver = webdriver.Chrome(service=service, options=opts)
     else:
-        # Selenium Manager tenta resolver automaticamente (se internet disponível)
         driver = webdriver.Chrome(options=opts)
 
-    # Proteções
     driver.set_page_load_timeout(60)
     return driver
 
 # =========================================================
-# INTERFACE LATERAL
+# Sidebar (Configurações)
 # =========================================================
 with st.sidebar:
     st.header("Configurações")
     data_inicio = st.date_input("Data Inicial", value=pd.to_datetime("2026-01-01"))
-    data_final = st.date_input("Data Final", value=pd.to_datetime("2026-01-13"))
+    data_final  = st.date_input("Data Final",  value=pd.to_datetime("2026-01-13"))
 
-    neg_label = "Direto"
+    neg_label    = "Direto"
     status_label = "300 - Pronto para Processamento"
 
-    st.caption("⚠️ Se o site demorar para renderizar, aumente os tempos de espera abaixo.")
-    wait_time_main = st.number_input("Tempo extra (segundos) pós login/troca de tela", min_value=0, value=8)
-    wait_time_download = st.number_input("Tempo extra (segundos) para concluir download", min_value=10, value=18)
+    st.caption("⚠️ Se o site demorar para renderizar, aumente os tempos abaixo.")
+    wait_time_main     = st.number_input("Tempo extra pós login/troca de tela (s)", min_value=0, value=8)
+    wait_time_download = st.number_input("Tempo extra para concluir download (s)", min_value=10, value=18)
+
+# (Opcional) Botão de teste do navegador
+if st.button("🧪 Testar navegador (Selenium)"):
+    d = configurar_driver()
+    try:
+        d.get("https://www.google.com")
+        st.success(f"Navegador OK! Título: {d.title}")
+        shot_path = os.path.join(DOWNLOAD_DIR, "test_google.png")
+        d.save_screenshot(shot_path)
+        st.image(shot_path, caption="Screenshot headless", use_column_width=True)
+    except Exception as e:
+        st.error(f"Falha ao abrir navegador: {e}")
+        capture_debug(d, "teste_selenium")
+    finally:
+        try:
+            d.quit()
+        except:
+            pass
 
 # =========================================================
-# BOTÃO DE EXECUÇÃO
+# Botão principal: executar automação
 # =========================================================
 if st.button("🚀 Iniciar Robô"):
     driver = configurar_driver()
@@ -355,43 +363,39 @@ if st.button("🚀 Iniciar Robô"):
             driver.find_element(By.ID, "input-12").send_keys(st.secrets["credentials"]["senha"] + Keys.ENTER)
             time.sleep(wait_time_main)
 
-            # 2. AMHPTISS (clique resiliente e troca de janela segura)
+            # 2. AMHPTISS (clique + troca de janela segura)
             prev_handles = driver.window_handles
             safe_click(driver, (By.XPATH, "//button[contains(., 'AMHPTISS')]"))
-            switched = False
             try:
                 wait_new_window_and_switch(driver, prev_handles, timeout=30)
-                switched = True
             except TimeoutException:
-                # Fallback: tenta navegar em link na mesma janela
+                # Fallback: mesma janela
                 try:
                     link = driver.find_element(By.XPATH, "//a[contains(., 'AMHPTISS')]")
                     href = link.get_attribute("href")
                     if href:
                         driver.get(href)
-                        switched = True
                     else:
                         driver.execute_script("arguments[0].click();", link)
-                        switched = True
                 except Exception as e:
                     capture_debug(driver, "amhptiss_click")
                     raise e
 
             time.sleep(wait_time_main)
 
-            # 3. Limpeza de Avisos/Pop-ups
+            # 3. Limpeza de avisos/pop-ups
             driver.execute_script("""
                 const avisos = document.querySelectorAll('center, #fechar-informativo, .modal');
                 avisos.forEach(el => el.remove());
             """)
 
-            # 4. Navegação via Script/Clicks
+            # 4. Navegação
             driver.execute_script("document.getElementById('IrPara').click();")
             time.sleep(2)
             safe_click(driver, (By.XPATH, "//span[normalize-space()='Consultório']"))
             safe_click(driver, (By.XPATH, "//a[@href='AtendimentosRealizados.aspx']"))
 
-            # 5. Aplicação de Filtros
+            # 5. Filtros
             st.write("📅 Aplicando filtros de data...")
             wait_visible(driver, (By.ID, "ctl00_MainContent_rdpDigitacaoDataInicio_dateInput"))\
                 .send_keys(data_inicio.strftime("%d/%m/%Y") + Keys.TAB)
@@ -401,10 +405,9 @@ if st.button("🚀 Iniciar Robô"):
             # Buscar
             safe_click(driver, (By.ID, "ctl00_MainContent_btnBuscar_input"))
 
-            # 6. Seleção e Exportação
+            # 6. Seleção e impressão
             st.write("⌛ Gerando lista de atendimentos...")
             wait_visible(driver, (By.CSS_SELECTOR, ".rgMasterTable"))
-
             driver.execute_script("document.getElementById('ctl00_MainContent_rdgAtendimentosRealizados_ctl00_ctl02_ctl00_SelectColumnSelectCheckBox').click();")
             time.sleep(2)
             driver.execute_script("document.getElementById('ctl00_MainContent_rbtImprimirAtendimentos_input').click();")
@@ -441,7 +444,8 @@ if st.button("🚀 Iniciar Robô"):
             time.sleep(wait_time_download)
 
             # 9. Processamento do download
-            arquivos = [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR) if f.lower().endswith((".xls", ".csv", ".xlsx"))]
+            arquivos = [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR)
+                        if f.lower().endswith((".xls", ".csv", ".xlsx"))]
             if arquivos:
                 recente = max(arquivos, key=os.path.getctime)
                 ext = os.path.splitext(recente)[1].lower()
@@ -453,11 +457,11 @@ if st.button("🚀 Iniciar Robô"):
                     os.remove(recente)
 
                 elif ext == ".csv":
-                    # CSV direto: lê respeitando separador provável (;)
+                    # CSV direto (tenta ; e fallback para ,)
                     try:
                         df_csv = pd.read_csv(recente, sep=";", encoding="utf-8-sig")
                     except Exception:
-                        df_csv = pd.read_csv(recente, sep=";", encoding="latin-1")
+                        df_csv = pd.read_csv(recente, sep=",", encoding="latin-1")
                     df_csv["Filtro_Status"] = sanitize_value_for_excel(status_label)
                     df_csv["Filtro_Negociacao"] = sanitize_value_for_excel(neg_label)
                     st.session_state.db_consolidado = pd.concat(
@@ -468,7 +472,6 @@ if st.button("🚀 Iniciar Robô"):
                     os.remove(recente)
 
                 elif ext == ".xlsx":
-                    # Caso o próprio AMHP exporte em EXCELOPENXML
                     df_xlsx = pd.read_excel(recente, engine="openpyxl")
                     df_xlsx["Filtro_Status"] = sanitize_value_for_excel(status_label)
                     df_xlsx["Filtro_Negociacao"] = sanitize_value_for_excel(neg_label)
@@ -478,7 +481,6 @@ if st.button("🚀 Iniciar Robô"):
                     )
                     st.success(f"✅ {len(st.session_state.db_consolidado)} registros processados (XLSX)!")
                     os.remove(recente)
-
             else:
                 st.error("Arquivo não encontrado. O sistema AMHP pode ter demorado demais ou bloqueou o download.")
                 capture_debug(driver, "sem_arquivo")
@@ -495,15 +497,14 @@ if st.button("🚀 Iniciar Robô"):
             pass
 
 # =========================================================
-# RESULTADOS & EXPORTAÇÕES (CSV + XLSX/xlsxwriter)
+# Resultados & Exportações (CSV + XLSX/xlsxwriter)
 # =========================================================
 if not st.session_state.db_consolidado.empty:
     st.divider()
-    # Mostra um preview saneado para evitar erro no dataframe viewer
     df_safe_preview = sanitize_df_for_excel(st.session_state.db_consolidado)
     st.dataframe(df_safe_preview)
 
-    # Exportação CSV (seguro)
+    # CSV
     csv_bytes = df_safe_preview.to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button(
         "💾 Baixar Relatório Consolidado (CSV)",
@@ -512,11 +513,10 @@ if not st.session_state.db_consolidado.empty:
         "text/csv",
     )
 
-    # Exportação Excel XLSX com xlsxwriter (mais tolerante que openpyxl)
+    # XLSX (xlsxwriter)
     xlsx_buffer = io.BytesIO()
     with pd.ExcelWriter(xlsx_buffer, engine="xlsxwriter") as writer:
         df_safe_preview.to_excel(writer, index=False, sheet_name="Relatório")
-        # Ajusta larguras de colunas automaticamente
         worksheet = writer.sheets["Relatório"]
         for i, col in enumerate(df_safe_preview.columns):
             try:
