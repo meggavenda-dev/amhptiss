@@ -396,4 +396,4 @@ if not st.session_state.db_consolidado.empty:
     st.divider()
     df_preview = sanitize_df(st.session_state.db_consolidado)
     st.subheader("📊 Base consolidada (temporária)")
-    st.dataframe(df_preview,
+    st.dataframe(df_preview),
