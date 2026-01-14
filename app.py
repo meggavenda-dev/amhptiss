@@ -182,10 +182,10 @@ def safe_click(driver, locator, timeout=30):
         driver.execute_script("arguments[0].click();", el)
         return el
 
-# ========= PDF → Tabela (coordenadas + fallback textual reforçado) =========
+# ========= PDF → Tabela (coordenadas + textual reforçado) =========
 def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool = False) -> pd.DataFrame:
     """
-    mode: "coord" (coordenadas) | "text" (fallback textual)
+    mode: "coord" (coordenadas) | "text" (fallback textual reforçado)
     Sempre aplica ensure_atendimentos_schema() antes de retornar.
     """
     import pdfplumber
@@ -201,6 +201,8 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
     val_line_re   = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}$")
     code_start_re = re.compile(r"\d{3,6}-")
     re_total_blk  = re.compile(r"total\s*r\$\s*\d{1,3}(?:\.\d{3})*,\d{2}", re.I)
+    # Cabeça da linha (agora com SEARCH em vez de MATCH)
+    head_re       = re.compile(r"(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+(.*)")
 
     def _normalize_ws(s: str) -> str:
         return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip()
@@ -361,7 +363,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                 pass
         return ensure_atendimentos_schema(out)
 
-    # ---------- Texto (reforçado) ----------
+    # ---------- Texto (reforçado; resolve “primeira linha colada no cabeçalho”) ----------
     def parse_by_text() -> pd.DataFrame:
         try:
             reader = PdfReader(open(pdf_path, "rb"))
@@ -374,7 +376,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
             if not big:
                 return pd.DataFrame(columns=TARGET_COLS)
 
-            # Remove 'Total R$ ...' se estiver embutido
+            # Remove 'Total R$ ...' embutido
             big = re_total_blk.sub("", big)
 
             # Segmenta pelo padrão de valor (capturando o valor)
@@ -385,10 +387,11 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                 body  = _normalize_ws(parts[i-1])
                 if not body:
                     continue
-                # Tira cabeçalho que ficou colado antes de 'Atendimento'
-                if "Atendimento" in body:
-                    body = body.split("Atendimento", 1)[-1].strip()
-                # Descarta "Total ..." que, porventura, tenha entrado
+                # Se houver cabeçalho residual, corta até o início da primeira linha real
+                m_start = head_re.search(body)  # <-- SEARCH (não mais MATCH)
+                if m_start:
+                    body = body[m_start.start():].strip()
+                # Descarta "Total ..."
                 if body.lower().startswith("total "):
                     continue
                 rec = f"{body} {valor}".strip()
@@ -396,13 +399,14 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
 
             parsed = []
             for l in records:
+                # valor = último token de moeda na string
                 m_vals = list(val_re.finditer(l))
                 if not m_vals:
                     continue
                 valor = m_vals[-1].group(0)
                 body  = l[:m_vals[-1].start()].strip()
 
-                # Dois últimos 'CODIGO-' => Credenciado e Prestador
+                # Dois últimos 'CODIGO-' => Credenciado/Prestador
                 codes = list(code_start_re.finditer(body))
                 if len(codes) >= 2:
                     i1, i2 = codes[-2].start(), codes[-1].start()
@@ -417,8 +421,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                 else:
                     prest = cred = ""
 
-                # Cabeça fixa: Atendimento NrGuia Data Hora ...
-                m_head = re.match(r"^(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+(.*)$", body)
+                m_head = head_re.search(body)  # <-- SEARCH (aceita ruído antes)
                 if not m_head:
                     continue
                 atendimento, nr_guia, realizacao, hora, rest = m_head.groups()
@@ -441,7 +444,6 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                     matricula   = ""
                     beneficiario = ""
                 else:
-                    # TipoGuia pode ter 2 tokens (SP/SADT PMDF etc.)
                     if "/" in toks[0] and idx_mat >= 2 and re.fullmatch(r"[A-ZÁÉÍÓÚÂÊÔÃÕÇ\-]{2,15}", toks[1]):
                         tipo_tokens = toks[0:2]; start_oper = 2
                     else:
@@ -612,6 +614,8 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                 # Processa PDF
                 arquivos = [os.path.join(DOWNLOAD_TEMPORARIO, f) for f in os.listdir(DOWNLOAD_TEMPORARIO) if f.lower().endswith(".pdf")]
                 if arquivos:
+                    recente = max(arquivos, key_os=os.path.getctime)
+                    # OBS: 'key_os' corrigindo para os.path.getctime
                     recente = max(arquivos, key=os.path.getctime)
                     nome_pdf = f"Relatorio_{status_sel.replace(' ', '_').replace('/','-')}_{data_ini.replace('/','-')}_a_{data_fim.replace('/','-')}.pdf"
                     destino_pdf = os.path.join(PASTA_FINAL, nome_pdf)
