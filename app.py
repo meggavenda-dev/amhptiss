@@ -153,7 +153,7 @@ def _preclean_report_text(raw: str) -> str:
       • dois blocos numéricos longos (Atendimento e NrGuia),
       • Data↔Hora,
       • Hora↔TipoGuia,
-      • TipoGuia↔Operadora (p.ex. 'SP/SADTBACEN(104)'),
+      • TipoGuia↔Operadora (p.ex. 'SP/SADTBACEN(104)' ou 'ConsultaGDF SAÚDE'),
       • ')'↔Matrícula.
     - Normaliza whitespace.
     """
@@ -171,8 +171,15 @@ def _preclean_report_text(raw: str) -> str:
     # Espaço entre Hora e próximo token alfabético (Tipo de Guia)
     txt = re.sub(r"(\d{2}:\d{2})(?=[A-Za-zÁ-Úá-úNÇS/])", r"\1 ", txt)
 
-    # Espaço entre Tipo de Guia e Operadora coladas
-    txt = re.sub(r"([A-Za-zÁ-Úá-ú/])([A-Z]{2,}\()", r"\1 \2", txt)
+    # Espaço entre Tipo de Guia e Operadora coladas (casos amplos)
+    # PATCH #1: amplia separação de colagens com/sem parênteses logo após
+    txt = re.sub(r'(?i)\b(Consulta)(?=[A-ZÁ-Ú])', r'\1 ', txt)
+    txt = re.sub(r'(?i)\b(SP/SADT)(?=[A-ZÁ-Ú])', r'\1 ', txt)
+    txt = re.sub(r'(?i)\b(Honorário(?:\s*Individual)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', txt)
+    txt = re.sub(r'(?i)\b(Não(?:\s*TISS)?(?:\s*-\s*Atendimento)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', txt)
+
+    # Casos com parênteses imediatamente após (mantido)
+    txt = re.sub(r"(Consulta|SP/SADT)(?=[A-Z]{2,}\()", r"\1 ", txt)
 
     # Espaço entre ')' e matrícula coladas
     txt = re.sub(r"(\))(\d{5,})", r"\1 \2", txt)
@@ -187,9 +194,7 @@ def _preclean_report_text(raw: str) -> str:
         if m2:
             txt = txt[m2.start():]
 
-    # Normaliza
-    txt = _normalize_ws2(txt)
-    return txt
+    return _normalize_ws2(txt)
 
 def is_mat_token(t: str) -> bool:
     if re.fullmatch(r"\d{5,}", t):
@@ -199,20 +204,30 @@ def is_mat_token(t: str) -> bool:
 def split_tipo_operadora(tokens):
     if not tokens:
         return "", [], 0
-    t0 = tokens[0].lower()
-    if "/" in tokens[0]:
+    t0 = tokens[0]
+    t0low = t0.lower()
+
+    # Se já tem '/', tratar colagem: SP/SADTBACEN → SP/SADT + BACEN
+    if "/" in t0:
+        # PATCH #2: cortar prefixo conhecido quando colado
+        if t0low.startswith("sp/sadt") and t0low != "sp/sadt":
+            rest0 = t0[len("SP/SADT"):]
+            tail  = ([rest0] if rest0 else []) + tokens[1:]
+            return "SP/SADT", tail, 1
+        return t0, tokens[1:], 1
+
+    # ConsultaGDF / ConsultaOMINT / ConsultaCONAB...
+    if t0low.startswith("consulta") and t0low != "consulta":
+        rest0 = t0[len("Consulta"):]
+        tail  = ([rest0] if rest0 else []) + tokens[1:]
+        return "Consulta", tail, 1
+
+    # Demais tipos conhecidos
+    if t0low in ("consulta", "sp/sadt", "honorário", "honorário individual",
+                 "não", "não tiss", "não tiss - atendimento"):
         return tokens[0], tokens[1:], 1
-    if t0 == "consulta":
-        return tokens[0], tokens[1:], 1
-    if t0 == "honorário" and len(tokens) >= 2:
-        return " ".join(tokens[:2]), tokens[2:], 2
-    if t0 == "não" and len(tokens) >= 3:
-        upto = 3
-        for i in range(1, min(5, len(tokens))):
-            if tokens[i].lower().startswith("atendimento"):
-                upto = i+1
-                break
-        return " ".join(tokens[:upto]), tokens[upto:], upto
+
+    # Default: 1º token é o tipo
     return tokens[0], tokens[1:], 1
 
 def parse_record_text(rec: str):
@@ -243,6 +258,13 @@ def parse_record_text(rec: str):
     if not m_head:
         return None
     atendimento, nr_guia, realizacao, hora, rest = m_head.groups()
+
+    # PATCH #1 (também aplicado aqui para robustez quando vem de split por valor)
+    rest = re.sub(r'(?i)\b(Consulta)(?=[A-ZÁ-Ú])', r'\1 ', rest)
+    rest = re.sub(r'(?i)\b(SP/SADT)(?=[A-ZÁ-Ú])', r'\1 ', rest)
+    rest = re.sub(r'(?i)\b(Honorário(?:\s*Individual)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', rest)
+    rest = re.sub(r'(?i)\b(Não(?:\s*TISS)?(?:\s*-\s*Atendimento)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', rest)
+    rest = re.sub(r"(Consulta|SP/SADT)(?=[A-Z]{2,}\()", r"\1 ", rest)
 
     toks = rest.split()
     tipo, tail, _ = split_tipo_operadora(toks)
@@ -382,15 +404,8 @@ _VAL_RE_UNI       = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")
 _CODE_START_UNI   = re.compile(r"\d{3,6}-")
 
 def split_tipo_operadora_any(tokens):
-    """Versão simples para separar TipoGuia e Operadora quando colados."""
-    if not tokens:
-        return "", [], 0
-    t0 = tokens[0].lower()
-    if "/" in tokens[0]:
-        return tokens[0], tokens[1:], 1
-    if t0 in ("consulta", "sp/sadt", "honorário", "não", "não tiss", "não tiss - atendimento"):
-        return tokens[0], tokens[1:], 1
-    return tokens[0], tokens[1:], 1
+    """(Mantido por compatibilidade) usa a versão aprimorada split_tipo_operadora()"""
+    return split_tipo_operadora(tokens)
 
 def parse_streaming_any(texto: str) -> pd.DataFrame:
     """
@@ -417,7 +432,7 @@ def parse_streaming_any(texto: str) -> pd.DataFrame:
 
         vals  = list(_VAL_RE_UNI.finditer(seg))
         if not vals:
-            seg_ext = s[start:min(len(s), end + 40)]
+            seg_ext = s[start:min(len(s), end + 120)]
             vals    = list(_VAL_RE_UNI.finditer(seg_ext))
             if not vals:
                 continue
@@ -442,6 +457,12 @@ def parse_streaming_any(texto: str) -> pd.DataFrame:
 
         hpos = working.find(hora)
         rest = working[hpos + len(hora):].strip()
+
+        # PATCH #1: normalização agressiva de colagens (TipoGuia ↔ Operadora)
+        rest = re.sub(r'(?i)\b(Consulta)(?=[A-ZÁ-Ú])', r'\1 ', rest)
+        rest = re.sub(r'(?i)\b(SP/SADT)(?=[A-ZÁ-Ú])', r'\1 ', rest)
+        rest = re.sub(r'(?i)\b(Honorário(?:\s*Individual)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', rest)
+        rest = re.sub(r'(?i)\b(Não(?:\s*TISS)?(?:\s*-\s*Atendimento)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', rest)
         rest = re.sub(r"(Consulta|SP/SADT)(?=[A-Z]{2,}\()", r"\1 ", rest)
 
         body  = rest
@@ -462,7 +483,7 @@ def parse_streaming_any(texto: str) -> pd.DataFrame:
             core   = body
 
         toks = core.split()
-        tipo, tail, _ = split_tipo_operadora_any(toks)
+        tipo, tail, _ = split_tipo_operadora(toks)
 
         idx_mat = None
         for j, t in enumerate(tail):
@@ -856,7 +877,16 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                     continue
                 atendimento, nr_guia, realizacao, hora, rest = m_head.groups()
 
+                # PATCH #1 replicado
+                rest = re.sub(r'(?i)\b(Consulta)(?=[A-ZÁ-Ú])', r'\1 ', rest)
+                rest = re.sub(r'(?i)\b(SP/SADT)(?=[A-ZÁ-Ú])', r'\1 ', rest)
+                rest = re.sub(r'(?i)\b(Honorário(?:\s*Individual)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', rest)
+                rest = re.sub(r'(?i)\b(Não(?:\s*TISS)?(?:\s*-\s*Atendimento)?)\s*(?=[A-ZÁ-Ú])', r'\1 ', rest)
+                rest = re.sub(r"(Consulta|SP/SADT)(?=[A-Z]{2,}\()", r"\1 ", rest)
+
                 toks = rest.split()
+                tipo, tail, _ = split_tipo_operadora(toks)
+
                 idx_mat = None
                 for j, t in enumerate(toks):
                     if re.fullmatch(r"\d+", t):
@@ -867,17 +897,14 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                             idx_mat = j; break
 
                 if idx_mat is None:
-                    tipo_guia   = toks[0]
-                    operadora   = " ".join(toks[1:]).strip()
+                    operadora   = " ".join(toks[1:]).strip() if len(toks) > 1 else ""
                     matricula   = ""
                     beneficiario = ""
+                    tipo_guia   = toks[0] if toks else ""
                 else:
-                    if "/" in toks[0] and idx_mat >= 2 and re.fullmatch(r"[A-ZÁÉÍÓÚÂÊÔÃÕÇ\-]{2,15}", toks[1]):
-                        tipo_tokens = toks[0:2]; start_oper = 2
-                    else:
-                        tipo_tokens = toks[0:1]; start_oper = 1
-                    tipo_guia   = " ".join(tipo_tokens)
-                    operadora   = " ".join(toks[start_oper:idx_mat]).strip()
+                    # corta tipo e compõe operadora até matrícula
+                    tipo_guia   = toks[0]
+                    operadora   = " ".join(toks[1:idx_mat]).strip()
                     j = idx_mat
                     mat_tokens = []
                     while j < len(toks) and re.fullmatch(r"\d+", toks[j]):
@@ -944,7 +971,7 @@ with st.sidebar:
     debug_parser       = st.checkbox("🧪 Debug do parser PDF", value=False)
     debug_heads        = st.checkbox("🧩 Mostrar contagem de cabeçalhos detectados (modo TEXTO)", value=True)
 
-    # 🔘 NOVO TOGGLE — Forçar parser streaming unificado
+    # 🔘 Toggle — Forçar parser streaming unificado
     force_streaming    = st.toggle("⚙️ Forçar parser streaming (texto colado/sem espaços)", value=True)
     st.caption("Ligado: usa o parser unificado `parse_streaming_any(texto)`.\nDesligado: usa o parser atual `parse_relatorio_text_to_atendimentos_df(texto)`.")
 
@@ -955,7 +982,7 @@ with st.expander("🧪 Colar TEXTO do relatório (sem automação)", expanded=Fa
         if not texto_manual.strip():
             st.warning("Cole o texto do relatório e tente novamente.")
         else:
-            # 🔁 Usa o toggle para decidir o parser
+            # Usa o toggle para decidir o parser
             if force_streaming:
                 df_txt = parse_streaming_any(texto_manual)
             else:
@@ -1080,7 +1107,7 @@ if st.button("🚀 Iniciar Processo"):
                         continue
 
                     st.write("📄 Processando TEXTO do relatório...")
-                    # 🔁 Usa o toggle para decidir o parser
+                    # Usa o toggle para decidir o parser
                     if force_streaming:
                         df_txt = parse_streaming_any(texto_relatorio)
                     else:
