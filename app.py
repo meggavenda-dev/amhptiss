@@ -121,15 +121,20 @@ def configurar_driver():
     driver.set_script_timeout(180)
     return driver
 
-def js_safe_click(driver, by, value, timeout=30):
-    el = WebDriverWait(driver, timeout).until(
-        EC.presence_of_element_located((by, value))
-    )
-    safe_click(driver, By.ID, "ctl00_MainContent_rdgAtendimentosRealizados_ctl00_ctl02_ctl00_SelectColumnSelectCheckBox")
-    time.sleep(0.5)  # pequeno delay para garantir o click
+# ========= Função Safe Click =========
+def safe_click(driver, by, value, retries=3, delay=0.5):
+    """Tenta clicar em um elemento, mesmo que o DOM seja atualizado (previne StaleElementReferenceException)."""
+    for i in range(retries):
+        try:
+            el = WebDriverWait(driver, 10).until(EC.presence_of_element_located((by, value)))
+            driver.execute_script("arguments[0].click();", el)
+            return True
+        except Exception:
+            time.sleep(delay)
+    raise RuntimeError(f"Não foi possível clicar no elemento: {value}")
 
 # ========= Parser PDF =========
-def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "text", debug: bool = False) -> pd.DataFrame:
+def parse_pdf_to_atendimentos_df(pdf_path: str) -> pd.DataFrame:
     from PyPDF2 import PdfReader
 
     val_re        = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")
@@ -140,7 +145,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "text", debug: bool 
     def _normalize_ws(s: str) -> str:
         return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip()
 
-    def parse_by_text() -> pd.DataFrame:
+    def parse_by_text():
         reader = PdfReader(open(pdf_path, "rb"))
         text_all = [page.extract_text() or "" for page in reader.pages]
         big = _normalize_ws(" ".join(text_all))
@@ -153,12 +158,10 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "text", debug: bool 
         records = []
         for i in range(1, len(parts), 2):
             valor = parts[i].strip()
-            body  = _normalize_ws(parts[i-1])
+            body = _normalize_ws(parts[i-1])
             m = head_re.search(body)
             if m:
                 body = body[m.start():]
-            if body.lower().startswith("total"):
-                continue
             records.append(f"{body} {valor}".strip())
 
         parsed = []
@@ -167,27 +170,25 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "text", debug: bool 
             if not m_vals:
                 continue
             valor = m_vals[-1].group(0)
-            body  = l[:m_vals[-1].start()].strip()
+            body = l[:m_vals[-1].start()].strip()
 
             codes = list(code_start_re.finditer(body))
             cred = prest = ""
             if len(codes) >= 2:
                 i1, i2 = codes[-2].start(), codes[-1].start()
-                cred  = body[i1:i2].strip()
+                cred = body[i1:i2].strip()
                 prest = body[i2:].strip()
-                body  = body[:i1].strip()
+                body = body[:i1].strip()
 
             m = head_re.search(body)
             if not m:
                 continue
             atendimento, nr_guia, realizacao, hora, rest = m.groups()
-
             toks = rest.split()
-            idx = next((i for i,t in enumerate(toks) if t.isdigit()), None)
             tipo_guia = toks[0]
-            operadora = " ".join(toks[1:idx]) if idx else " ".join(toks[1:])
-            matricula = toks[idx] if idx else ""
-            beneficiario = " ".join(toks[idx+1:]) if idx else ""
+            operadora = " ".join(toks[1:-2])
+            matricula = toks[-2]
+            beneficiario = toks[-1]
 
             parsed.append({
                 "Atendimento": atendimento,
@@ -210,21 +211,19 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "text", debug: bool 
 # ========= Sidebar =========
 with st.sidebar:
     st.header("Configurações")
-    data_ini    = st.text_input("📅 Data Inicial (dd/mm/aaaa)", value="01/01/2026")
-    data_fim    = st.text_input("📅 Data Final (dd/mm/aaaa)", value="13/01/2026")
-    negociacao  = st.text_input("🤝 Tipo de Negociação", value="Direto")
+    data_ini    = st.text_input("📅 Data Inicial", "01/01/2026")
+    data_fim    = st.text_input("📅 Data Final", "13/01/2026")
+    negociacao  = st.text_input("🤝 Negociação", "Direto")
     status_list = st.multiselect(
         "📌 Status",
-        options=["300 - Pronto para Processamento","200 - Em Análise","100 - Recebido","400 - Processado"],
+        ["300 - Pronto para Processamento","200 - Em Análise"],
         default=["300 - Pronto para Processamento"]
     )
-    wait_time_main     = st.number_input("⏱️ Tempo extra pós login/troca de tela (s)", min_value=0, value=10)
-    wait_time_download = st.number_input("⏱️ Tempo extra para concluir download (s)", min_value=10, value=18)
-    debug_parser       = st.checkbox("🧪 Debug do parser PDF", value=False)
+    wait_time_main     = st.number_input("⏱️ Espera navegação", 0, 60, 10)
+    wait_time_download = st.number_input("⏱️ Espera download", 10, 60, 18)
 
 # ========= Botão principal =========
 if st.button("🚀 Iniciar Processo (PDF)"):
-
     driver = configurar_driver()
     try:
         with st.status("Executando automação...", expanded=True) as status:
@@ -266,36 +265,30 @@ if st.button("🚀 Iniciar Processo (PDF)"):
             st.write("📂 Abrindo Atendimentos...")
             driver.execute_script("document.getElementById('IrPara').click();")
             time.sleep(2)
-            js_safe_click(driver, By.XPATH, "//span[normalize-space()='Consultório']")
-            js_safe_click(driver, By.XPATH, "//a[@href='AtendimentosRealizados.aspx']")
+            safe_click(driver, By.XPATH, "//span[normalize-space()='Consultório']")
+            safe_click(driver, By.XPATH, "//a[@href='AtendimentosRealizados.aspx']")
             time.sleep(3)
 
-            # ====== NOVO: Seleção do credenciado (teste com 14406) ======
+            # 4.5) Seleção de credenciado (exemplo código 14406)
             credenciado_codigo = "14406"
-            input_cred = WebDriverWait(driver, wait_time_main).until(
+            cred_input = WebDriverWait(driver, 20).until(
                 EC.presence_of_element_located((By.ID, "ctl00_MainContent_rcbCredenciado_Input"))
             )
-            input_cred.clear()
-            input_cred.send_keys(credenciado_codigo)
-            time.sleep(0.5)
-            lista = WebDriverWait(driver, wait_time_main).until(
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "li.rcbHovered, li.rcbFocused, li.rcbItem"))
+            cred_input.clear()
+            cred_input.send_keys(credenciado_codigo)
+            time.sleep(1)
+
+            cred_li = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, f"//li[contains(@class,'rcbHovered') and contains(text(),'{credenciado_codigo}')]")
+                )
             )
-            item_correspondente = None
-            for li in lista:
-                if credenciado_codigo in li.text:
-                    item_correspondente = li
-                    break
-            if item_correspondente:
-                driver.execute_script("arguments[0].click();", item_correspondente)
-                time.sleep(0.5)
-            else:
-                st.warning(f"Credenciado {credenciado_codigo} não encontrado")
+            driver.execute_script("arguments[0].click();", cred_li)
+            time.sleep(1)
 
             # 5) Loop de Status
             for status_sel in status_list:
                 st.write(f"📝 Filtros → Negociação: **{negociacao}**, Status: **{status_sel}**, Período: **{data_ini}–{data_fim}**")
-
                 # Negociação/Status/Datas
                 neg_input  = wait.until(EC.presence_of_element_located((By.ID, "ctl00_MainContent_rcbTipoNegociacao_Input")))
                 stat_input = wait.until(EC.presence_of_element_located((By.ID, "ctl00_MainContent_rcbStatus_Input")))
@@ -329,14 +322,16 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                 st.write("📥 Concluindo download do PDF...")
                 time.sleep(wait_time_download)
 
-                # Processa PDF
+                # ====== Processa PDF ======
                 arquivos = [
                     os.path.join(DOWNLOAD_TEMPORARIO, f)
                     for f in os.listdir(DOWNLOAD_TEMPORARIO)
                     if f.lower().endswith(".pdf")
                 ]
+
                 if arquivos:
                     recente = max(arquivos, key=os.path.getctime)
+
                     nome_pdf = (
                         f"Relatorio_{status_sel.replace(' ', '_').replace('/','-')}_"
                         f"{data_ini.replace('/','-')}_a_{data_fim.replace('/','-')}.pdf"
@@ -346,7 +341,7 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                     st.success(f"✅ PDF salvo: {destino_pdf}")
 
                     st.write("📄 Extraindo Tabela — Atendimentos do PDF...")
-                    df_pdf = parse_pdf_to_atendimentos_df(destino_pdf, mode="text", debug=debug_parser)
+                    df_pdf = parse_pdf_to_atendimentos_df(destino_pdf)
 
                     if not df_pdf.empty:
                         df_pdf["Filtro_Negociacao"] = sanitize_value(negociacao)
@@ -354,19 +349,11 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                         df_pdf["Periodo_Inicio"]    = sanitize_value(data_ini)
                         df_pdf["Periodo_Fim"]       = sanitize_value(data_fim)
 
-                        cols_show = TARGET_COLS
-                        missing = [c for c in cols_show if c not in df_pdf.columns]
-                        if missing:
-                            st.warning(f"As colunas {missing} não estavam presentes; exibindo todas as colunas retornadas para inspeção.")
-                            st.write("Colunas retornadas:", list(df_pdf.columns))
-                            st.dataframe(df_pdf, use_container_width=True)
-                        else:
-                            st.dataframe(df_pdf[cols_show], use_container_width=True)
-
                         st.session_state.db_consolidado = pd.concat([st.session_state.db_consolidado, df_pdf], ignore_index=True)
+                        st.dataframe(df_pdf[TARGET_COLS], use_container_width=True)
                         st.write(f"📊 Registros acumulados: {len(st.session_state.db_consolidado)}")
                     else:
-                        st.warning("⚠️ Modo textual não conseguiu extrair linhas.")
+                        st.warning("⚠️ Nenhuma linha extraída do PDF.")
 
                     try:
                         driver.switch_to.default_content()
@@ -374,10 +361,6 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                         pass
                 else:
                     st.error("❌ PDF não encontrado após o download.")
-                    try:
-                        driver.switch_to.default_content()
-                    except Exception:
-                        pass
 
             status.update(label="✅ Fim do processo!", state="complete")
 
@@ -403,9 +386,8 @@ if not st.session_state.db_consolidado.empty:
     st.dataframe(df_preview, use_container_width=True)
 
     csv_bytes = df_preview.to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button(
-        "💾 Baixar Consolidação (CSV)",
-        csv_bytes,
-        file_name="consolidado_amhptiss.csv",
-        mime="text/csv"
-    )
+    st.download_button("💾 Baixar Consolidação (CSV)", csv_bytes, file_name="consolidado_amhp.csv", mime="text/csv")
+
+    if st.button("🗑️ Limpar Banco Temporário"):
+        st.session_state.db_consolidado = pd.DataFrame()
+        st.rerun()
