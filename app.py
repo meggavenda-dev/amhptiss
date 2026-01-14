@@ -611,22 +611,30 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                 st.write("📥 Concluindo download do PDF...")
                 time.sleep(wait_time_download)
 
+                # ====== Processa PDF (correção de indentação + remoção de key_os) ======
+                arquivos = [
+                    os.path.join(DOWNLOAD_TEMPORARIO, f)
+                    for f in os.listdir(DOWNLOAD_TEMPORARIO)
+                    if f.lower().endswith(".pdf")
+                ]
 
-                 #Processa PDF
-                    arquivos = [os.path.join(DOWNLOAD_TEMPORARIO, f) for f in os.listdir(DOWNLOAD_TEMPORARIO) if f.lower().endswith(".pdf")]
-                    if arquivos:
-                        recente = max(arquivos, key_os=os.path.getctime)  # ❌ REMOVER esta linha
-                        # OBS: 'key_os' corrigindo para os.path.getctime
-                        recente = max(arquivos, key=os.path.getctime)     # ✅ MANTER esta linha
-                        nome_pdf = f"Relatorio_{status_sel.replace(' ', '_').replace('/','-')}_{data_ini.replace('/','-')}_a_{data_fim.replace('/','-')}.pdf"
-                        destino_pdf = os.path.join(PASTA_FINAL, nome_pdf)
-                        shutil.move(recente, destino_pdf)
-                        st.success(f"✅ PDF salvo: {destino_pdf}")
+                if arquivos:
+                    # pega o mais recente corretamente
+                    # ❌ REMOVIDO: recente = max(arquivos, key_os=os.path.getctime)
+                    # ✅ MANTIDO:
+                    recente = max(arquivos, key=os.path.getctime)
 
-                        st.write("📄 Extraindo Tabela — Atendimentos do PDF...")
-                        # >>> FORÇANDO MODO TEXTUAL (seletor da UI é apenas visual)
-                        df_pdf = parse_pdf_to_atendimentos_df(destino_pdf, mode="text", debug=debug_parser)
+                    nome_pdf = (
+                        f"Relatorio_{status_sel.replace(' ', '_').replace('/','-')}_"
+                        f"{data_ini.replace('/','-')}_a_{data_fim.replace('/','-')}.pdf"
+                    )
+                    destino_pdf = os.path.join(PASTA_FINAL, nome_pdf)
+                    shutil.move(recente, destino_pdf)
+                    st.success(f"✅ PDF salvo: {destino_pdf}")
 
+                    st.write("📄 Extraindo Tabela — Atendimentos do PDF...")
+                    # >>> FORÇANDO MODO TEXTUAL (seletor da UI é apenas visual)
+                    df_pdf = parse_pdf_to_atendimentos_df(destino_pdf, mode="text", debug=debug_parser)
 
                     if not df_pdf.empty:
                         # Metadados
