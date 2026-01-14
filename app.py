@@ -133,9 +133,52 @@ def ensure_atendimentos_schema(df: pd.DataFrame) -> pd.DataFrame:
     df2 = df2[TARGET_COLS]
     return df2
 
+# ========= Selenium =========
+def configurar_driver():
+    opts = Options()
+    chrome_binary  = os.environ.get("CHROME_BINARY", "/usr/bin/chromium")
+    driver_binary  = os.environ.get("CHROMEDRIVER_BINARY", "/usr/bin/chromedriver")
+    if os.path.exists(chrome_binary):
+        opts.binary_location = chrome_binary
+
+    opts.add_argument("--headless")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1920,1080")
+
+    prefs = {
+        "download.default_directory": DOWNLOAD_TEMPORARIO,
+        "download.prompt_for_download": False,
+        "safebrowsing.enabled": True,
+        "profile.default_content_setting_values.automatic_downloads": 1,
+    }
+    opts.add_experimental_option("prefs", prefs)
+
+    if os.path.exists(driver_binary):
+        service = Service(executable_path=driver_binary)
+        driver = webdriver.Chrome(service=service, options=opts)
+    else:
+        driver = webdriver.Chrome(options=opts)
+
+    driver.set_page_load_timeout(60)
+    return driver
+
+def wait_visible(driver, locator, timeout=30):
+    return WebDriverWait(driver, timeout).until(EC.visibility_of_element_located(locator))
+
+def safe_click(driver, locator, timeout=30):
+    try:
+        el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable(locator))
+        el.click()
+        return el
+    except (ElementClickInterceptedException, TimeoutException, WebDriverException):
+        el = WebDriverWait(driver, timeout).until(EC.presence_of_element_located(locator))
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        driver.execute_script("arguments[0].click();", el)
+        return el
+
 # ========= PDF → Tabela =========
-def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool = False) -> pd.DataFrame:
-    import pdfplumber
+def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "text", debug: bool = False) -> pd.DataFrame:
     from PyPDF2 import PdfReader
 
     val_re        = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")
@@ -146,106 +189,74 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
     def _normalize_ws(s: str) -> str:
         return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip()
 
-    # >>> AJUSTE PDF TEXTUAL <<<
+    # >>> AJUSTE EXCLUSIVO AQUI <<<
     def parse_by_text() -> pd.DataFrame:
-        try:
-            reader = PdfReader(open(pdf_path, "rb"))
-            text_all = []
-            for page in reader.pages:
-                text_all.append(page.extract_text() or "")
-            big = _normalize_ws(" ".join(text_all))
-            if not big:
-                return pd.DataFrame(columns=TARGET_COLS)
-
-            big = re_total_blk.sub("", big)
-
-            parts = re.split(rf"({val_re.pattern})", big)
-            records = []
-            for i in range(1, len(parts), 2):
-                valor = parts[i].strip()
-                body  = _normalize_ws(parts[i-1])
-                if not body:
-                    continue
-                m_start = head_re.search(body)
-                if m_start:
-                    body = body[m_start.start():].strip()
-                if body.lower().startswith("total "):
-                    continue
-                records.append(f"{body} {valor}".strip())
-
-            parsed = []
-            for l in records:
-                m_vals = list(val_re.finditer(l))
-                if not m_vals:
-                    continue
-                valor = m_vals[-1].group(0)
-                body  = l[:m_vals[-1].start()].strip()
-
-                codes = list(code_start_re.finditer(body))
-                if len(codes) >= 2:
-                    i1, i2 = codes[-2].start(), codes[-1].start()
-                    prest = body[i2:].strip()
-                    cred  = body[i1:i2].strip()
-                    body  = body[:i1].strip()
-                elif len(codes) == 1:
-                    i2    = codes[-1].start()
-                    prest = body[i2:].strip()
-                    cred  = ""
-                    body  = body[:i2].strip()
-                else:
-                    prest = cred = ""
-
-                m_head = head_re.search(body)
-                if not m_head:
-                    continue
-                atendimento, nr_guia, realizacao, hora, rest = m_head.groups()
-
-                toks = rest.split()
-                def is_num(t): return re.fullmatch(r"\d+", t) is not None
-
-                idx_mat = None
-                for j, t in enumerate(toks):
-                    if is_num(t):
-                        idx_mat = j; break
-
-                if idx_mat is None:
-                    tipo_guia = toks[0]
-                    operadora = " ".join(toks[1:])
-                    matricula = ""
-                    beneficiario = ""
-                else:
-                    tipo_guia = toks[0]
-                    operadora = " ".join(toks[1:idx_mat])
-                    j = idx_mat
-                    mat_tokens = []
-                    while j < len(toks) and is_num(toks[j]):
-                        mat_tokens.append(toks[j]); j += 1
-                    matricula = " ".join(mat_tokens)
-                    beneficiario = " ".join(toks[j:])
-
-                parsed.append({
-                    "Atendimento": atendimento,
-                    "NrGuia": nr_guia,
-                    "Realizacao": realizacao,
-                    "Hora": hora,
-                    "TipoGuia": tipo_guia,
-                    "Operadora": operadora,
-                    "Matricula": matricula,
-                    "Beneficiario": beneficiario,
-                    "Credenciado": cred,
-                    "Prestador": prest,
-                    "ValorTotal": valor,
-                })
-
-            out = pd.DataFrame(parsed)
-            return ensure_atendimentos_schema(out)
-
-        except Exception as e:
-            if debug:
-                st.error(f"[text] Falha: {e}")
+        reader = PdfReader(open(pdf_path, "rb"))
+        text_all = [page.extract_text() or "" for page in reader.pages]
+        big = _normalize_ws(" ".join(text_all))
+        if not big:
             return pd.DataFrame(columns=TARGET_COLS)
 
+        big = re_total_blk.sub("", big)
+        parts = re.split(rf"({val_re.pattern})", big)
+
+        records = []
+        for i in range(1, len(parts), 2):
+            valor = parts[i].strip()
+            body  = _normalize_ws(parts[i-1])
+            m = head_re.search(body)
+            if m:
+                body = body[m.start():]
+            if body.lower().startswith("total"):
+                continue
+            records.append(f"{body} {valor}".strip())
+
+        parsed = []
+        for l in records:
+            m_vals = list(val_re.finditer(l))
+            if not m_vals:
+                continue
+            valor = m_vals[-1].group(0)
+            body  = l[:m_vals[-1].start()].strip()
+
+            codes = list(code_start_re.finditer(body))
+            cred = prest = ""
+            if len(codes) >= 2:
+                i1, i2 = codes[-2].start(), codes[-1].start()
+                cred  = body[i1:i2].strip()
+                prest = body[i2:].strip()
+                body  = body[:i1].strip()
+
+            m = head_re.search(body)
+            if not m:
+                continue
+            atendimento, nr_guia, realizacao, hora, rest = m.groups()
+
+            toks = rest.split()
+            idx = next((i for i,t in enumerate(toks) if t.isdigit()), None)
+            tipo_guia = toks[0]
+            operadora = " ".join(toks[1:idx]) if idx else " ".join(toks[1:])
+            matricula = toks[idx] if idx else ""
+            beneficiario = " ".join(toks[idx+1:]) if idx else ""
+
+            parsed.append({
+                "Atendimento": atendimento,
+                "NrGuia": nr_guia,
+                "Realizacao": realizacao,
+                "Hora": hora,
+                "TipoGuia": tipo_guia,
+                "Operadora": operadora,
+                "Matricula": matricula,
+                "Beneficiario": beneficiario,
+                "Credenciado": cred,
+                "Prestador": prest,
+                "ValorTotal": valor,
+            })
+
+        return ensure_atendimentos_schema(pd.DataFrame(parsed))
+
     return sanitize_df(parse_by_text())
+
 
     out = parse_by_coords()
     if out.empty:
