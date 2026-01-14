@@ -1,6 +1,0 @@
-
-__pycache__/
-*.pyc
-.streamlit/secrets.toml
-# Descomente para não versionar relatórios:
-# reports/
