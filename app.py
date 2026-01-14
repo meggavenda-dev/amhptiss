@@ -236,7 +236,8 @@ if st.button("🚀 Iniciar Processo (PDF)"):
     except Exception as e:
         st.error(f"Erro: {e}")
     finally:
-        driver.quit()
+        try:
+            driver.quit()
         except Exception:
             pass
 
