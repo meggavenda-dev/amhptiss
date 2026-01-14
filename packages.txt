@@ -1,6 +1,5 @@
 chromium
 chromium-driver
-# Dependências comuns do headless Chrome
 libnss3
 libxss1
 libasound2
