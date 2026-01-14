@@ -17,8 +17,10 @@ from selenium.common.exceptions import TimeoutException, ElementClickIntercepted
 try:
     chrome_bin_secret = st.secrets.get("env", {}).get("CHROME_BINARY", None)
     driver_bin_secret = st.secrets.get("env", {}).get("CHROMEDRIVER_BINARY", None)
-    if chrome_bin_secret:  os.environ["CHROME_BINARY"]      = chrome_bin_secret
-    if driver_bin_secret:  os.environ["CHROMEDRIVER_BINARY"] = driver_bin_secret
+    if chrome_bin_secret:
+        os.environ["CHROME_BINARY"] = chrome_bin_secret
+    if driver_bin_secret:
+        os.environ["CHROMEDRIVER_BINARY"] = driver_bin_secret
 except Exception:
     pass
 
@@ -43,18 +45,23 @@ os.makedirs(DOWNLOAD_TEMPORARIO, exist_ok=True)
 _ILLEGAL_CTRL_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
 
 def _sanitize_text(s: str) -> str:
-    if s is None: return s
+    if s is None:
+        return s
     s = s.replace("\x00", "")
     s = _ILLEGAL_CTRL_RE.sub("", s)
     s = s.replace("\u00A0", " ").strip()
     return s
 
 def sanitize_value(v):
-    if pd.isna(v): return v
+    if pd.isna(v):
+        return v
     if isinstance(v, (bytes, bytearray)):
-        try: v = v.decode("utf-8", "ignore")
-        except Exception: v = v.decode("latin-1", "ignore")
-    if isinstance(v, str): return _sanitize_text(v)
+        try:
+            v = v.decode("utf-8", "ignore")
+        except Exception:
+            v = v.decode("latin-1", "ignore")
+    if isinstance(v, str):
+        return _sanitize_text(v)
     return v
 
 def sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -75,183 +82,209 @@ def configurar_driver():
     opts = Options()
     chrome_binary  = os.environ.get("CHROME_BINARY", "/usr/bin/chromium")
     driver_binary  = os.environ.get("CHROMEDRIVER_BINARY", "/usr/bin/chromedriver")
-    if os.path.exists(chrome_binary): opts.binary_location = chrome_binary
-    opts.add_argument("--headless"); opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage"); opts.add_argument("--window-size=1920,1080")
-    prefs = {"download.default_directory": DOWNLOAD_TEMPORARIO, "download.prompt_for_download": False,
-             "safebrowsing.enabled": True, "profile.default_content_setting_values.automatic_downloads": 1}
+    if os.path.exists(chrome_binary):
+        opts.binary_location = chrome_binary
+
+    opts.add_argument("--headless")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1920,1080")
+
+    prefs = {
+        "download.default_directory": DOWNLOAD_TEMPORARIO,
+        "download.prompt_for_download": False,
+        "safebrowsing.enabled": True,
+        "profile.default_content_setting_values.automatic_downloads": 1,
+    }
     opts.add_experimental_option("prefs", prefs)
-    driver = (webdriver.Chrome(service=Service(executable_path=driver_binary), options=opts)
-              if os.path.exists(driver_binary) else webdriver.Chrome(options=opts))
+
+    if os.path.exists(driver_binary):
+        service = Service(executable_path=driver_binary)
+        driver = webdriver.Chrome(service=service, options=opts)
+    else:
+        driver = webdriver.Chrome(options=opts)
+
     driver.set_page_load_timeout(60)
     return driver
 
-def wait_visible(driver, locator, timeout=30): return WebDriverWait(driver, timeout).until(EC.visibility_of_element_located(locator))
+def wait_visible(driver, locator, timeout=30):
+    return WebDriverWait(driver, timeout).until(EC.visibility_of_element_located(locator))
+
 def safe_click(driver, locator, timeout=30):
     try:
-        el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable(locator)); el.click(); return el
+        el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable(locator))
+        el.click()
+        return el
     except (ElementClickInterceptedException, TimeoutException, WebDriverException):
         el = WebDriverWait(driver, timeout).until(EC.presence_of_element_located(locator))
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        driver.execute_script("arguments[0].click();", el); return el
+        driver.execute_script("arguments[0].click();", el)
+        return el
 
-# ========= PDF → Tabela por colunas (pdfplumber) =========
+# ========= PDF → Tabela por colunas (pdfplumber, multi-page, robusto) =========
 def parse_pdf_to_atendimentos_df(pdf_path: str) -> pd.DataFrame:
     """
     Extrai a Tabela — Atendimentos por coordenadas:
-    - Descobre o cabeçalho (linha com 'Atendimento ... Valor Total').
-    - Define colunas por caixas (x0/x1) usando as posições das palavras do cabeçalho.
-    - Agrupa palavras por faixas horizontais (linhas), cortando por colunas.
-    - Remove 'Total R$ ...' final.
+    - Localiza o cabeçalho (banda com 'Atendimento ... Valor Total').
+    - Define colunas por caixas (x0/x1) com base nas palavras do cabeçalho.
+    - Agrupa palavras em bandas horizontais e corta por colunas.
+    - Remove a linha 'Total R$ ...'.
+    - Varre TODAS as páginas e concatena.
     """
     import pdfplumber
+
     val_re = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}$")  # ex.: 104,38
-    # 1) Abre PDF e pega a primeira página (relatório é de 1 página nos seus exemplos) [1](https://amhpdfbr-my.sharepoint.com/personal/guilherme_cavalcante_amhp_com_br/_layouts/15/Doc.aspx?sourcedoc=%7B9680BAF3-0CBB-4670-886B-52010E59BD51%7D&file=2026-01-14T05-06_export.csv&action=default&mobileredirect=true)
+    code_start_re = re.compile(r"\d{3,6}-")            # início bloco CODIGO-Nome
+    all_records = []
+
     with pdfplumber.open(pdf_path) as pdf:
-        page = pdf.pages[0]
-
-        # 2) Extrai todas as palavras com coordenadas
-        words = page.extract_words(use_text_flow=True, extra_attrs=["x0","x1","top","bottom"])
-        text = " ".join([w["text"] for w in words])
-
-        # 3) Localiza linha do cabeçalho (contém 'Atendimento' e 'Valor Total') [1](https://amhpdfbr-my.sharepoint.com/personal/guilherme_cavalcante_amhp_com_br/_layouts/15/Doc.aspx?sourcedoc=%7B9680BAF3-0CBB-4670-886B-52010E59BD51%7D&file=2026-01-14T05-06_export.csv&action=default&mobileredirect=true)
-        header_y = None
-        header_words = []
-        for w in words:
-            if "Atendimento" in w["text"]:
-                # Aproximação: pega banda horizontal do cabeçalho
-                y_top = w["top"]
-                band = [ww for ww in words if abs(ww["top"] - y_top) < 2.0]
-                band_text = " ".join([b["text"] for b in band])
-                if ("Valor" in band_text) and ("Total" in band_text):
-                    header_y = y_top
-                    header_words = sorted(band, key=lambda z: z["x0"])
-                    break
-        if header_y is None:
-            # fallback: usa extract_tables se não achou (layout muito diferente)
-            tbls = page.extract_tables()
-            if tbls:
-                df = pd.DataFrame(tbls[0])
-                # tenta mapear nomes
-                # (mantém fallback simples; o grid abaixo cobre 99% dos casos)
-                df.columns = df.iloc[0]; df = df.iloc[1:].dropna(how="all", axis=1)
-                return sanitize_df(df)
-
-        # 4) Define colunas por ranges x0/x1 a partir das palavras do cabeçalho
-        #    Vamos procurar labels chave: Atendimento | Nr. Guia | Realização | Hora | Tipo de Guia | Operadora | Matrícula | Beneficiário | Credenciado | Prestador | Valor Total
-        labels_expected = ["Atendimento","Nr.","Nr","Guia","Realização","Hora","Tipo","de","Guia","Operadora",
-                           "Matrícula","Beneficiário","Credenciado","Prestador","Valor","Total"]
-        header_sorted = sorted(header_words, key=lambda z: z["x0"])
-        # Junta palavras vizinhas em blocos (por proximidade x)
-        blocks = []
-        cur = [header_sorted[0]]
-        for w in header_sorted[1:]:
-            if abs(w["x0"] - cur[-1]["x1"]) <= 6:  # palavras muito próximas do cabeçalho pertencem ao mesmo bloco
-                cur.append(w)
-            else:
-                blocks.append(cur); cur=[w]
-        blocks.append(cur)
-
-        # Texto dos blocos + range x
-        header_blocks = [{"text":" ".join([b["text"] for b in bl]), "x0":min([b["x0"] for b in bl]), "x1":max([b["x1"] for b in bl])} for bl in blocks]
-
-        # Mapeia blocos para nomes finais das colunas (heurística)
-        def map_block(txt):
-            t = txt.lower()
-            if "atendimento" in t:                   return "Atendimento"
-            if "nr" in t and "guia" in t:            return "NrGuia"
-            if "realiza" in t:                       return "Realizacao"
-            if "hora" in t:                          return "Hora"
-            if "tipo" in t and "guia" in t:          return "TipoGuia"
-            if "operadora" in t:                     return "Operadora"
-            if "matr" in t:                          return "Matricula"
-            if "benef" in t:                         return "Beneficiario"
-            if "credenciado" in t:                   return "Credenciado"
-            if "prestador" in t:                     return "Prestador"
-            if "valor" in t and "total" in t:        return "ValorTotal"
-            return None
-
-        columns = []
-        for hb in header_blocks:
-            name = map_block(hb["text"])
-            if name:
-                columns.append({"name":name, "x0":hb["x0"], "x1":hb["x1"]})
-
-        # Ordena colunas por x0
-        columns = sorted(columns, key=lambda c: c["x0"])
-
-        # 5) Agrupa palavras em “linhas” abaixo do cabeçalho (bandas horizontais)
-        #    Ignora a banda do cabeçalho e tudo acima
-        data_words = [w for w in words if w["top"] > header_y + 2]
-        # Remove a linha de "Total R$ ..." (fica geralmente abaixo das linhas de dados) [1](https://amhpdfbr-my.sharepoint.com/personal/guilherme_cavalcante_amhp_com_br/_layouts/15/Doc.aspx?sourcedoc=%7B9680BAF3-0CBB-4670-886B-52010E59BD51%7D&file=2026-01-14T05-06_export.csv&action=default&mobileredirect=true)
-        total_indices = [i for i,w in enumerate(data_words) if w["text"].lower()=="total"]
-        if total_indices:
-            # corta dados acima do 'Total'
-            total_y = data_words[total_indices[0]]["top"]
-            data_words = [w for w in data_words if w["top"] < total_y - 2]
-
-        # cria bandas horizontais de linha (tolerância ~2.0 pts)
-        rows = []
-        band = []
-        last_top = None
-        for w in sorted(data_words, key=lambda z: (round(z["top"],1), z["x0"])):
-            if last_top is None or abs(w["top"] - last_top) <= 2.0:
-                band.append(w); last_top = w["top"]
-            else:
-                rows.append(band); band=[w]; last_top = w["top"]
-        if band: rows.append(band)
-
-        # 6) Para cada banda, coleta o texto de cada coluna por faixa x (x0/x1)
-        records = []
-        for row_words in rows:
-            cols_text = {}
-            for col in columns:
-                col_words = [w for w in row_words if (w["x0"] >= col["x0"] - 1) and (w["x1"] <= col["x1"] + 1)]
-                txt = " ".join([w["text"] for w in sorted(col_words, key=lambda z: z["x0"])])
-                cols_text[col["name"]] = txt.strip()
-            # Heurística: se não há ValorTotal, pode ser uma banda de quebra; pula
-            if not cols_text.get("ValorTotal") or not val_re.search(cols_text["ValorTotal"]):
+        for page in pdf.pages:
+            words = page.extract_words(use_text_flow=True, extra_attrs=["x0","x1","top","bottom"])
+            if not words:
                 continue
-            records.append(cols_text)
 
-        df = pd.DataFrame(records)
-        # Ajustes finos: algumas colunas podem “vazar” texto longo entre Credenciado/Prestador
-        # Se 'Credenciado' ou 'Prestador' vierem vazios, tenta recuperar por um padrão "CODIGO-Nome"
-        code_start_re = re.compile(r"\d{3,6}-")
-        cleaned = []
-        for _, r in df.iterrows():
-            # ValorTotal normaliza como string
-            valor = r.get("ValorTotal","").strip()
-            # Monta linha reconstituída para fallback do code-name caso necessário
-            tail = " ".join([str(r.get("Beneficiario","")).strip(), str(r.get("Credenciado","")).strip(), str(r.get("Prestador","")).strip()]).strip()
-            starts = [m.start() for m in code_start_re.finditer(tail)]
-            cred, prest = r.get("Credenciado","").strip(), r.get("Prestador","").strip()
-            if not cred or not prest:
-                if len(starts) >= 2:
+            # 1) Localiza banda do cabeçalho
+            header_y = None
+            header_words = []
+            for w in words:
+                if "Atendimento" in w["text"]:
+                    y_top = w["top"]
+                    band = [ww for ww in words if abs(ww["top"] - y_top) < 2.0]
+                    band_text = " ".join([b["text"] for b in band])
+                    if ("Valor" in band_text) and ("Total" in band_text):
+                        header_y = y_top
+                        header_words = sorted(band, key=lambda z: z["x0"])
+                        break
+
+            # fallback: tenta extract_tables se não encontrou cabeçalho
+            if header_y is None or not header_words:
+                tbls = page.extract_tables()
+                if tbls:
+                    df = pd.DataFrame(tbls[0])
+                    if not df.empty:
+                        df.columns = df.iloc[0]
+                        df = df.iloc[1:].dropna(how="all", axis=1)
+                        # tentativa simples de mapear colunas e acumular
+                        # (mantém como fallback; o grid abaixo é mais confiável)
+                        for _, r in df.iterrows():
+                            all_records.append({k: str(r.get(k, "")).strip() for k in df.columns})
+                continue  # passa para próxima página
+
+            # 2) Blocos de cabeçalho (junta palavras vizinhas)
+            header_sorted = sorted(header_words, key=lambda z: z["x0"])
+            if not header_sorted:
+                continue
+
+            blocks = []
+            cur = [header_sorted[0]]
+            for w in header_sorted[1:]:
+                if abs(w["x0"] - cur[-1]["x1"]) <= 6:
+                    cur.append(w)
+                else:
+                    blocks.append(cur)
+                    cur = [w]
+            blocks.append(cur)
+
+            header_blocks = [{
+                "text": " ".join([b["text"] for b in bl]),
+                "x0": min([b["x0"] for b in bl]),
+                "x1": max([b["x1"] for b in bl]),
+            } for bl in blocks]
+
+            def map_block(txt):
+                t = txt.lower()
+                if "atendimento" in t:                   return "Atendimento"
+                if "nr" in t and "guia" in t:            return "NrGuia"
+                if "realiza" in t:                       return "Realizacao"
+                if "hora" in t:                          return "Hora"
+                if "tipo" in t and "guia" in t:          return "TipoGuia"
+                if "operadora" in t:                     return "Operadora"
+                if "matr" in t:                          return "Matricula"
+                if "benef" in t:                         return "Beneficiario"
+                if "credenciado" in t:                   return "Credenciado"
+                if "prestador" in t:                     return "Prestador"
+                if "valor" in t and "total" in t:        return "ValorTotal"
+                return None
+
+            columns = []
+            for hb in header_blocks:
+                name = map_block(hb["text"])
+                if name:
+                    columns.append({"name": name, "x0": hb["x0"], "x1": hb["x1"]})
+            columns = sorted(columns, key=lambda c: c["x0"])
+            if not columns:
+                continue
+
+            # 3) Palavras de dados: abaixo do cabeçalho; corta antes de "Total"
+            data_words = [w for w in words if w["top"] > header_y + 2]
+            total_candidates = [w for w in data_words if w["text"].lower() == "total"]
+            if total_candidates:
+                total_y = total_candidates[0]["top"]
+                data_words = [w for w in data_words if w["top"] < total_y - 2]
+
+            # 4) Bandas horizontais (linhas) com tolerância
+            rows = []
+            band = []
+            last_top = None
+            for w in sorted(data_words, key=lambda z: (round(z["top"], 1), z["x0"])):
+                if last_top is None or abs(w["top"] - last_top) <= 2.0:
+                    band.append(w)
+                    last_top = w["top"]
+                else:
+                    rows.append(band)
+                    band = [w]
+                    last_top = w["top"]
+            if band:
+                rows.append(band)
+
+            # 5) Coleta texto por faixa x de cada coluna
+            for row_words in rows:
+                cols_text = {}
+                for col in columns:
+                    col_words = [w for w in row_words if (w["x0"] >= col["x0"] - 1) and (w["x1"] <= col["x1"] + 1)]
+                    txt = " ".join([w["text"] for w in sorted(col_words, key=lambda z: z["x0"])])
+                    cols_text[col["name"]] = txt.strip()
+
+                # Garante que é banda de dados: precisa ter ValorTotal válido
+                if not cols_text.get("ValorTotal") or not val_re.search(cols_text["ValorTotal"]):
+                    continue
+
+                # Ajuste fino Credenciado/Prestador por padrão CODIGO-Nome, se vierem vazios
+                tail = " ".join([
+                    cols_text.get("Beneficiario",""),
+                    cols_text.get("Credenciado",""),
+                    cols_text.get("Prestador",""),
+                ]).strip()
+                starts = [m.start() for m in code_start_re.finditer(tail)]
+                cred = cols_text.get("Credenciado","").strip()
+                prest = cols_text.get("Prestador","").strip()
+                if (not cred or not prest) and len(starts) >= 2:
                     i1, i2 = starts[-2], starts[-1]
                     prest = tail[i2:].strip()
                     cred  = tail[i1:i2].strip()
-            cleaned.append({
-                "Atendimento":   r.get("Atendimento","").strip(),
-                "NrGuia":        r.get("NrGuia","").strip(),
-                "Realizacao":    r.get("Realizacao","").strip(),
-                "Hora":          r.get("Hora","").strip(),
-                "TipoGuia":      r.get("TipoGuia","").strip(),
-                "Operadora":     r.get("Operadora","").strip(),
-                "Matricula":     r.get("Matricula","").strip(),
-                "Beneficiario":  r.get("Beneficiario","").strip(),
-                "Credenciado":   cred,
-                "Prestador":     prest,
-                "ValorTotal":    valor,
-            })
-        out = pd.DataFrame(cleaned)
-        # Ordena por data/hora
+
+                all_records.append({
+                    "Atendimento":   cols_text.get("Atendimento","").strip(),
+                    "NrGuia":        cols_text.get("NrGuia","").strip(),
+                    "Realizacao":    cols_text.get("Realizacao","").strip(),
+                    "Hora":          cols_text.get("Hora","").strip(),
+                    "TipoGuia":      cols_text.get("TipoGuia","").strip(),
+                    "Operadora":     cols_text.get("Operadora","").strip(),
+                    "Matricula":     cols_text.get("Matricula","").strip(),
+                    "Beneficiario":  cols_text.get("Beneficiario","").strip(),
+                    "Credenciado":   cred,
+                    "Prestador":     prest,
+                    "ValorTotal":    cols_text.get("ValorTotal","").strip(),
+                })
+
+    out = pd.DataFrame(all_records)
+    if not out.empty:
         try:
-            out["Realizacao_dt"] = pd.to_datetime(out["Realizacao"], format="%d/%m/%Y")
+            out["Realizacao_dt"] = pd.to_datetime(out["Realizacao"], format="%d/%m/%Y", errors="coerce")
             out = out.sort_values(["Realizacao_dt","Hora"]).drop(columns=["Realizacao_dt"])
         except Exception:
             pass
-        return sanitize_df(out)
+    return sanitize_df(out)
 
 # ========= UI =========
 with st.sidebar:
@@ -259,10 +292,11 @@ with st.sidebar:
     data_ini    = st.text_input("📅 Data Inicial (dd/mm/aaaa)", value="01/01/2026")
     data_fim    = st.text_input("📅 Data Final (dd/mm/aaaa)", value="13/01/2026")
     negociacao  = st.text_input("🤝 Tipo de Negociação", value="Direto")
-    status_list = st.multiselect("📌 Status", options=[
-        "300 - Pronto para Processamento","200 - Em Análise","100 - Recebido","400 - Processado"
-    ], default=["300 - Pronto para Processamento"])
-
+    status_list = st.multiselect(
+        "📌 Status",
+        options=["300 - Pronto para Processamento","200 - Em Análise","100 - Recebido","400 - Processado"],
+        default=["300 - Pronto para Processamento"]
+    )
     wait_time_main     = st.number_input("⏱️ Tempo extra pós login/troca de tela (s)", min_value=0, value=10)
     wait_time_download = st.number_input("⏱️ Tempo extra para concluir download (s)", min_value=10, value=18)
 
@@ -280,17 +314,20 @@ if st.button("🚀 Iniciar Processo (PDF)"):
             driver.find_element(By.ID, "input-12").send_keys(st.secrets["credentials"]["senha"] + Keys.ENTER)
             time.sleep(wait_time_main)
 
-            # 2. AMHPTISS (força clique)
+            # 2. AMHPTISS
             st.write("🔄 Acessando TISS...")
             try:
                 btn_tiss = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'AMHPTISS')]")))
                 driver.execute_script("arguments[0].click();", btn_tiss)
             except Exception:
                 elems = driver.find_elements(By.XPATH, "//*[contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'TISS')]")
-                if elems: driver.execute_script("arguments[0].click();", elems[0])
-                else: raise RuntimeError("Não foi possível localizar AMHPTISS/TISS.")
+                if elems:
+                    driver.execute_script("arguments[0].click();", elems[0])
+                else:
+                    raise RuntimeError("Não foi possível localizar AMHPTISS/TISS.")
             time.sleep(wait_time_main)
-            if len(driver.window_handles) > 1: driver.switch_to.window(driver.window_handles[-1])
+            if len(driver.window_handles) > 1:
+                driver.switch_to.window(driver.window_handles[-1])
 
             # 3. Limpeza
             st.write("🧹 Limpando tela...")
@@ -299,7 +336,8 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                     const avisos = document.querySelectorAll('center, #fechar-informativo, .modal');
                     avisos.forEach(el => el.remove());
                 """)
-            except Exception: pass
+            except Exception:
+                pass
 
             # 4. Navegação
             st.write("📂 Abrindo Atendimentos...")
@@ -333,9 +371,10 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                 time.sleep(wait_time_main)
 
                 # Iframe do ReportViewer
-                if len(driver.find_elements(By.TAG_NAME, "iframe")) > 0: driver.switch_to.frame(0)
+                if len(driver.find_elements(By.TAG_NAME, "iframe")) > 0:
+                    driver.switch_to.frame(0)
 
-                # Exportar sempre em PDF (evita CSV instável) [1](https://amhpdfbr-my.sharepoint.com/personal/guilherme_cavalcante_amhp_com_br/_layouts/15/Doc.aspx?sourcedoc=%7B9680BAF3-0CBB-4670-886B-52010E59BD51%7D&file=2026-01-14T05-06_export.csv&action=default&mobileredirect=true)
+                # Exportar sempre em PDF
                 dropdown = wait.until(EC.presence_of_element_located((By.ID, "ReportView_ReportToolbar_ExportGr_FormatList_DropDownList")))
                 Select(dropdown).select_by_value("PDF")
                 time.sleep(2)
@@ -374,12 +413,16 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                     else:
                         st.warning("⚠️ Não foi possível extrair linhas do PDF. Verifique o arquivo salvo.")
 
-                    try: driver.switch_to.default_content()
-                    except Exception: pass
+                    try:
+                        driver.switch_to.default_content()
+                    except Exception:
+                        pass
                 else:
                     st.error("❌ PDF não encontrado após o download. O SSRS pode ter demorado ou bloqueado.")
-                    try: driver.switch_to.default_content()
-                    except Exception: pass
+                    try:
+                        driver.switch_to.default_content()
+                    except Exception:
+                        pass
 
             status.update(label="✅ Fim do processo!", state="complete")
 
@@ -392,8 +435,10 @@ if st.button("🚀 Iniciar Processo (PDF)"):
         except Exception:
             pass
     finally:
-        try: driver.quit()
-        except Exception: pass
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
 # ========= Resultados & Export =========
 if not st.session_state.db_consolidado.empty:
