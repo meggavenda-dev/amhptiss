@@ -25,8 +25,8 @@ except Exception:
     pass
 
 # ========= Página =========
-st.set_page_config(page_title="AMHP - Exportador PDF + Consolidação", layout="wide")
-st.title("🏥 Exportador AMHP (PDF) + Consolidador")
+st.set_page_config(page_title="AMHP - Exportador (Texto/PDF) + Consolidação", layout="wide")
+st.title("🏥 Exportador AMHP — Texto (ReportViewer) / PDF — Consolidador")
 
 if "db_consolidado" not in st.session_state:
     st.session_state.db_consolidado = pd.DataFrame()
@@ -138,6 +138,161 @@ def ensure_atendimentos_schema(df: pd.DataFrame) -> pd.DataFrame:
     df2 = df2[TARGET_COLS]
     return df2
 
+# ========= Regex e Parser de TEXTO (ReportViewer) =========
+val_re        = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")  # valor pt-BR
+head_re       = re.compile(r"(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+(.*)")
+code_start_re = re.compile(r"\d{3,6}-")
+re_total_blk  = re.compile(r"total\s*r\$\s*\d{1,3}(?:\.\d{3})*,\d{2}", re.I)
+
+def _normalize_ws2(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").replace("\u00A0", " ")).strip()
+
+def is_mat_token(t: str) -> bool:
+    """Heurística de 'Matrícula': números ou alfanum com 5+ chars (cobre casos com X)."""
+    if re.fullmatch(r"\d{5,}", t):
+        return True
+    return bool(re.fullmatch(r"[0-9A-Z]{5,}", t))
+
+def split_tipo_operadora(tokens):
+    """
+    Heurística para separar TipoGuia e Operadora antes da matrícula.
+    Cobre: 'Consulta', 'SP/SADT', 'Honorário Individual', 'Não TISS - Atendimento'.
+    """
+    if not tokens:
+        return "", [], 0
+
+    t0 = tokens[0].lower()
+    if "/" in tokens[0]:
+        return tokens[0], tokens[1:], 1
+    if t0 == "consulta":
+        return tokens[0], tokens[1:], 1
+    if t0 == "honorário" and len(tokens) >= 2:
+        return " ".join(tokens[:2]), tokens[2:], 2
+    if t0 == "não" and len(tokens) >= 3:
+        upto = 3
+        for i in range(1, min(5, len(tokens))):
+            if tokens[i].lower().startswith("atendimento"):
+                upto = i+1
+                break
+        return " ".join(tokens[:upto]), tokens[upto:], upto
+    return tokens[0], tokens[1:], 1
+
+def parse_record_text(rec: str):
+    """Converte uma linha textual em colunas da Tabela — Atendimentos."""
+    rec = _normalize_ws2(rec)
+    rec = re_total_blk.sub("", rec)
+
+    # Valor (última ocorrência)
+    m_vals = list(val_re.finditer(rec))
+    if not m_vals:
+        return None
+    valor = m_vals[-1].group(0)
+    body  = rec[:m_vals[-1].start()].strip()
+
+    # Credenciado/Prestador pelos blocos "CODIGO-"
+    codes = list(code_start_re.finditer(body))
+    if len(codes) >= 2:
+        i1, i2 = codes[-2].start(), codes[-1].start()
+        prest = body[i2:].strip()
+        cred  = body[i1:i2].strip()
+        body  = body[:i1].strip()
+    elif len(codes) == 1:
+        i2    = codes[-1].start()
+        prest = body[i2:].strip()
+        cred  = ""
+        body  = body[:i2].strip()
+    else:
+        prest = cred = ""
+
+    # Cabeçalho line: Atendimento / NrGuia / Data / Hora / resto
+    m_head = head_re.search(body)
+    if not m_head:
+        return None
+    atendimento, nr_guia, realizacao, hora, rest = m_head.groups()
+
+    # Tipo/Operadora/Matrícula/Beneficiário
+    toks = rest.split()
+    tipo, tail, _ = split_tipo_operadora(toks)
+
+    idx_mat = None
+    for j, t in enumerate(tail):
+        if is_mat_token(t):
+            idx_mat = j
+            break
+
+    if idx_mat is None:
+        operadora    = " ".join(tail).strip()
+        matricula    = ""
+        beneficiario = ""
+    else:
+        operadora = " ".join(tail[:idx_mat]).strip()
+        # Matricula pode ter múltiplos tokens contíguos
+        k = idx_mat
+        mat_tokens = []
+        while k < len(tail) and is_mat_token(tail[k]):
+            mat_tokens.append(tail[k]); k += 1
+        matricula    = " ".join(mat_tokens).strip()
+        beneficiario = " ".join(tail[k:]).strip()
+
+    return {
+        "Atendimento":  atendimento,
+        "NrGuia":       nr_guia,
+        "Realizacao":   realizacao,
+        "Hora":         hora,
+        "TipoGuia":     tipo,
+        "Operadora":    operadora,
+        "Matricula":    matricula,
+        "Beneficiario": beneficiario,
+        "Credenciado":  cred,
+        "Prestador":    prest,
+        "ValorTotal":   valor,
+    }
+
+def parse_relatorio_text_to_atendimentos_df(texto: str) -> pd.DataFrame:
+    """Parser principal para TODO o texto colado/obtido do ReportViewer."""
+    big = _normalize_ws2(texto)
+    if not big:
+        return pd.DataFrame(columns=TARGET_COLS)
+
+    big = re_total_blk.sub("", big)
+
+    # Segmenta por VALOR (captura o valor e o corpo anterior)
+    parts = re.split(rf"({val_re.pattern})", big)
+    records = []
+    for i in range(1, len(parts), 2):
+        valor = parts[i].strip()
+        body  = _normalize_ws2(parts[i-1])
+        if not body:
+            continue
+        m_start = head_re.search(body)
+        if not m_start:
+            continue
+        body = body[m_start.start():].strip()
+        if body.lower().startswith("total "):
+            continue
+        records.append(f"{body} {valor}".strip())
+
+    parsed = []
+    for rec in records:
+        row = parse_record_text(rec)
+        if row:
+            parsed.append(row)
+
+    out = pd.DataFrame(parsed)
+    if not out.empty:
+        try:
+            out["Realizacao_dt"] = pd.to_datetime(out["Realizacao"], format="%d/%m/%Y", errors="coerce")
+            out = out.sort_values(["Realizacao_dt","Hora"]).drop(columns=["Realizacao_dt"])
+        except Exception:
+            pass
+    return ensure_atendimentos_schema(sanitize_df(out))
+
+def to_float_br(s):
+    try:
+        return float(str(s).replace('.', '').replace(',', '.'))
+    except Exception:
+        return 0.0
+
 # ========= Selenium =========
 def configurar_driver():
     opts = Options()
@@ -197,14 +352,13 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
     COL_MARGIN   = 4.0
 
     # Regex comuns
-    val_re        = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")
-    val_line_re   = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}$")
-    code_start_re = re.compile(r"\d{3,6}-")
-    re_total_blk  = re.compile(r"total\s*r\$\s*\d{1,3}(?:\.\d{3})*,\d{2}", re.I)
-    # Cabeça da linha (agora com SEARCH em vez de MATCH)
-    head_re       = re.compile(r"(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+(.*)")
+    val_re_local        = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")
+    val_line_re         = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}$")
+    code_start_re_local = re.compile(r"\d{3,6}-")
+    re_total_blk_local  = re.compile(r"total\s*r\$\s*\d{1,3}(?:\.\d{3})*,\d{2}", re.I)
+    head_re_local       = re.compile(r"(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+(.*)")
 
-    def _normalize_ws(s: str) -> str:
+    def _normalize_ws_local(s: str) -> str:
         return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip()
 
     # ---------- Coordenadas ----------
@@ -226,7 +380,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                     for w in words:
                         if "Atendimento" in w["text"]:
                             y_top = w["top"]
-                            band = [ww for ww in words if abs(ww["top"] - y_top) < TOP_TOL]
+                            band = [ww for ww in words if abs(ww["top"] - y_top) <= TOP_TOL]
                             band_text = " ".join([b["text"] for b in band])
                             if ("Valor" in band_text) and ("Total" in band_text):
                                 header_y = y_top
@@ -301,7 +455,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                             rows.append(band); band = [w]; last_top = w["top"]
                     if band: rows.append(band)
 
-                    # Atribuição por centro mais próximo / interseção
+                    # Atribuição por centro/interseção
                     col_centers = [(c["name"], (c["x0"] + c["x1"]) / 2.0) for c in columns]
                     def assign_to_nearest_col(w):
                         wc = (w["x0"] + w["x1"]) / 2.0
@@ -329,8 +483,8 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                             continue
 
                         # Ajuste Credenciado/Prestador
-                        tail = _normalize_ws(" ".join([cols_text.get("Beneficiario",""), cols_text.get("Credenciado",""), cols_text.get("Prestador","")]))
-                        starts = [m.start() for m in code_start_re.finditer(tail)]
+                        tail = _normalize_ws_local(" ".join([cols_text.get("Beneficiario",""), cols_text.get("Credenciado",""), cols_text.get("Prestador","")]))
+                        starts = [m.start() for m in code_start_re_local.finditer(tail)]
                         cred = cols_text.get("Credenciado","").strip()
                         prest = cols_text.get("Prestador","").strip()
                         if (not cred or not prest) and len(starts) >= 2:
@@ -363,51 +517,43 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                 pass
         return ensure_atendimentos_schema(out)
 
-    # ---------- Texto (reforçado; resolve “primeira linha colada no cabeçalho”) ----------
+    # ---------- Texto (fallback) ----------
     def parse_by_text() -> pd.DataFrame:
         try:
             reader = PdfReader(open(pdf_path, "rb"))
-            # Junta TODO o texto
             text_all = []
             for page in reader.pages:
                 txt = page.extract_text() or ""
                 text_all.append(txt)
-            big = _normalize_ws(" ".join(text_all))
+            big = _normalize_ws_local(" ".join(text_all))
             if not big:
                 return pd.DataFrame(columns=TARGET_COLS)
 
-            # Remove 'Total R$ ...' embutido
-            big = re_total_blk.sub("", big)
+            big = re_total_blk_local.sub("", big)
 
-            # Segmenta pelo padrão de valor (capturando o valor)
-            parts = re.split(rf"({val_re.pattern})", big)
+            parts = re.split(rf"({val_re_local.pattern})", big)
             records = []
             for i in range(1, len(parts), 2):
                 valor = parts[i].strip()
-                body  = _normalize_ws(parts[i-1])
+                body  = _normalize_ws_local(parts[i-1])
                 if not body:
                     continue
-                # Se houver cabeçalho residual, corta até o início da primeira linha real
-                m_start = head_re.search(body)  # <-- SEARCH (não mais MATCH)
+                m_start = head_re_local.search(body)
                 if m_start:
                     body = body[m_start.start():].strip()
-                # Descarta "Total ..."
                 if body.lower().startswith("total "):
                     continue
-                rec = f"{body} {valor}".strip()
-                records.append(rec)
+                records.append(f"{body} {valor}".strip())
 
             parsed = []
             for l in records:
-                # valor = último token de moeda na string
-                m_vals = list(val_re.finditer(l))
+                m_vals = list(val_re_local.finditer(l))
                 if not m_vals:
                     continue
                 valor = m_vals[-1].group(0)
                 body  = l[:m_vals[-1].start()].strip()
 
-                # Dois últimos 'CODIGO-' => Credenciado/Prestador
-                codes = list(code_start_re.finditer(body))
+                codes = list(code_start_re_local.finditer(body))
                 if len(codes) >= 2:
                     i1, i2 = codes[-2].start(), codes[-1].start()
                     prest = body[i2:].strip()
@@ -421,17 +567,16 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                 else:
                     prest = cred = ""
 
-                m_head = head_re.search(body)  # <-- SEARCH (aceita ruído antes)
+                m_head = head_re_local.search(body)
                 if not m_head:
                     continue
                 atendimento, nr_guia, realizacao, hora, rest = m_head.groups()
 
                 toks = rest.split()
-                def is_num(t): return re.fullmatch(r"\d+", t) is not None
-
+                # simplificada
                 idx_mat = None
                 for j, t in enumerate(toks):
-                    if is_num(t):
+                    if re.fullmatch(r"\d+", t):
                         idx_mat = j; break
                 if idx_mat is None:
                     for j, t in enumerate(toks):
@@ -452,7 +597,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                     operadora   = " ".join(toks[start_oper:idx_mat]).strip()
                     j = idx_mat
                     mat_tokens = []
-                    while j < len(toks) and is_num(toks[j]):
+                    while j < len(toks) and re.fullmatch(r"\d+", toks[j]):
                         mat_tokens.append(toks[j]); j += 1
                     matricula    = " ".join(mat_tokens)
                     beneficiario = " ".join(toks[j:]).strip()
@@ -485,7 +630,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                 st.error(f"[text] Falha: {e}")
             return pd.DataFrame(columns=TARGET_COLS)
 
-    # Seleciona modo
+    # Seleção de modo
     if mode == "text":
         return sanitize_df(parse_by_text())
 
@@ -507,28 +652,39 @@ with st.sidebar:
         default=["300 - Pronto para Processamento"]
     )
     wait_time_main     = st.number_input("⏱️ Tempo extra pós login/troca de tela (s)", min_value=0, value=10)
-    wait_time_download = st.number_input("⏱️ Tempo extra para concluir download (s)", min_value=10, value=18)
-    # Apenas visual — a chamada do parser será forçada para "text"
-    extraction_mode    = st.selectbox("🧠 Modo de extração do PDF (visual)", ["Coordenadas (recomendado)", "Texto (fallback)"])
+    wait_time_download = st.number_input("⏱️ Tempo extra para concluir download (s) [apenas PDF]", min_value=10, value=18)
+
+    extraction_mode    = st.selectbox(
+        "🧠 Modo de extração do relatório",
+        ["Texto (sem PDF) — recomendado", "PDF — exportar e tratar (legado)"]
+    )
     debug_parser       = st.checkbox("🧪 Debug do parser PDF", value=False)
 
-# ========= (Opcional) Processar PDF manualmente =========
-with st.expander("🧪 Testar parser com upload de PDF (sem automação)", expanded=False):
-    up = st.file_uploader("Envie um PDF do AMHPTISS para teste", type=["pdf"])
-    if up and st.button("Processar PDF (teste)"):
-        tmp_pdf = os.path.join(DOWNLOAD_TEMPORARIO, "teste_upload.pdf")
-        with open(tmp_pdf, "wb") as f:
-            f.write(up.getvalue())
-        # Força TEXTUAL mesmo no teste
-        df_test = parse_pdf_to_atendimentos_df(tmp_pdf, mode="text", debug=debug_parser)
-        if df_test.empty:
-            st.error("Parser não conseguiu extrair linhas deste PDF usando o modo textual.")
+# ========= (Opcional) Processar TEXTO manualmente =========
+with st.expander("🧪 Colar TEXTO do relatório (sem automação)", expanded=False):
+    texto_manual = st.text_area("📋 Cole aqui o texto completo do ReportViewer:", height=250)
+    if st.button("Processar TEXTO (manual)"):
+        if not texto_manual.strip():
+            st.warning("Cole o texto do relatório e tente novamente.")
         else:
-            st.success(f"{len(df_test)} linha(s) extraída(s) pelo modo textual.")
-            st.dataframe(df_test, use_container_width=True)
+            df_txt = parse_relatorio_text_to_atendimentos_df(texto_manual)
+            if df_txt.empty:
+                st.error("Parser não conseguiu extrair linhas deste TEXTO.")
+            else:
+                df_txt["Filtro_Negociacao"] = sanitize_value(negociacao)
+                df_txt["Filtro_Status"]     = "Manual (Texto)"
+                df_txt["Periodo_Inicio"]    = sanitize_value(data_ini)
+                df_txt["Periodo_Fim"]       = sanitize_value(data_fim)
+
+                total_br = f"R$ {df_txt['ValorTotal'].apply(to_float_br).sum():,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                st.info(f"📑 Total do texto processado: **{total_br}** — {len(df_txt)} linha(s)")
+                st.dataframe(df_txt[TARGET_COLS], use_container_width=True)
+
+                st.session_state.db_consolidado = pd.concat([st.session_state.db_consolidado, df_txt], ignore_index=True)
+                st.success(f"✅ Adicionado à consolidação. Registros acumulados: {len(st.session_state.db_consolidado)}")
 
 # ========= Botão principal =========
-if st.button("🚀 Iniciar Processo (PDF)"):
+if st.button("🚀 Iniciar Processo"):
     driver = configurar_driver()
     try:
         with st.status("Executando automação...", expanded=True) as status:
@@ -601,74 +757,114 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                 if len(driver.find_elements(By.TAG_NAME, "iframe")) > 0:
                     driver.switch_to.frame(0)
 
-                # Exportar sempre em PDF
-                dropdown = wait.until(EC.presence_of_element_located((By.ID, "ReportView_ReportToolbar_ExportGr_FormatList_DropDownList")))
-                Select(dropdown).select_by_value("PDF")
-                time.sleep(2)
-                export_btn = driver.find_element(By.ID, "ReportView_ReportToolbar_ExportGr_Export")
-                driver.execute_script("arguments[0].click();", export_btn)
+                if extraction_mode.startswith("Texto"):
+                    # ====== NOVO: Captura TEXTO direto do ReportViewer ======
+                    st.write("🧾 Capturando TEXTO do relatório no ReportViewer...")
+                    try:
+                        # Dá um pequeno tempo para render do SSRS
+                        time.sleep(2)
+                        # Captura texto do body (cobre a maioria dos viewers)
+                        texto_relatorio = driver.find_element(By.TAG_NAME, "body").text
+                    except Exception:
+                        texto_relatorio = ""
 
-                st.write("📥 Concluindo download do PDF...")
-                time.sleep(wait_time_download)
+                    if not texto_relatorio.strip():
+                        st.warning("Não consegui capturar o texto do relatório automaticamente. Tente novamente ou use o expander 'Colar TEXTO'.")
+                        try:
+                            driver.switch_to.default_content()
+                        except Exception:
+                            pass
+                        continue
 
-                # ====== Processa PDF (correção de indentação + remoção de key_os) ======
-                arquivos = [
-                    os.path.join(DOWNLOAD_TEMPORARIO, f)
-                    for f in os.listdir(DOWNLOAD_TEMPORARIO)
-                    if f.lower().endswith(".pdf")
-                ]
+                    st.write("📄 Processando TEXTO do relatório...")
+                    df_txt = parse_relatorio_text_to_atendimentos_df(texto_relatorio)
 
-                if arquivos:
-                    # pega o mais recente corretamente
-                    # ❌ REMOVIDO: recente = max(arquivos, key_os=os.path.getctime)
-                    # ✅ MANTIDO:
-                    recente = max(arquivos, key=os.path.getctime)
-
-                    nome_pdf = (
-                        f"Relatorio_{status_sel.replace(' ', '_').replace('/','-')}_"
-                        f"{data_ini.replace('/','-')}_a_{data_fim.replace('/','-')}.pdf"
-                    )
-                    destino_pdf = os.path.join(PASTA_FINAL, nome_pdf)
-                    shutil.move(recente, destino_pdf)
-                    st.success(f"✅ PDF salvo: {destino_pdf}")
-
-                    st.write("📄 Extraindo Tabela — Atendimentos do PDF...")
-                    # >>> FORÇANDO MODO TEXTUAL (seletor da UI é apenas visual)
-                    df_pdf = parse_pdf_to_atendimentos_df(destino_pdf, mode="text", debug=debug_parser)
-
-                    if not df_pdf.empty:
+                    if not df_txt.empty:
                         # Metadados
-                        df_pdf["Filtro_Negociacao"] = sanitize_value(negociacao)
-                        df_pdf["Filtro_Status"]     = sanitize_value(status_sel)
-                        df_pdf["Periodo_Inicio"]    = sanitize_value(data_ini)
-                        df_pdf["Periodo_Fim"]       = sanitize_value(data_fim)
+                        df_txt["Filtro_Negociacao"] = sanitize_value(negociacao)
+                        df_txt["Filtro_Status"]     = sanitize_value(status_sel)
+                        df_txt["Periodo_Inicio"]    = sanitize_value(data_ini)
+                        df_txt["Periodo_Fim"]       = sanitize_value(data_fim)
 
-                        # Guard das colunas
+                        # Total do lote
+                        total_br = f"R$ {df_txt['ValorTotal'].apply(to_float_br).sum():,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                        st.info(f"📑 Total do lote (TEXTO): **{total_br}** — {len(df_txt)} linha(s)")
+
+                        # Preview
                         cols_show = TARGET_COLS
-                        missing = [c for c in cols_show if c not in df_pdf.columns]
-                        if missing:
-                            st.warning(f"As colunas {missing} não estavam presentes; exibindo todas as colunas retornadas para inspeção.")
-                            st.write("Colunas retornadas:", list(df_pdf.columns))
-                            st.dataframe(df_pdf, use_container_width=True)
-                        else:
-                            st.dataframe(df_pdf[cols_show], use_container_width=True)
+                        st.dataframe(df_txt[cols_show], use_container_width=True)
 
                         # Consolida
-                        st.session_state.db_consolidado = pd.concat([st.session_state.db_consolidado, df_pdf], ignore_index=True)
+                        st.session_state.db_consolidado = pd.concat([st.session_state.db_consolidado, df_txt], ignore_index=True)
                         st.write(f"📊 Registros acumulados: {len(st.session_state.db_consolidado)}")
                     else:
-                        st.warning("⚠️ Modo textual não conseguiu extrair linhas. Envie o PDF pelo expander de teste para analisarmos.")
+                        st.warning("⚠️ Parser de TEXTO não conseguiu extrair linhas. Use o expander para colar manualmente ou troque para PDF.")
 
                     try:
                         driver.switch_to.default_content()
                     except Exception:
                         pass
+
                 else:
-                    st.error("❌ PDF não encontrado após o download. O SSRS pode ter demorado ou bloqueado.")
-                    try:
-                        driver.switch_to.default_content()
-                    except Exception:
-                        pass
+                    # ====== Fluxo legado: Exportar PDF ======
+                    dropdown = wait.until(EC.presence_of_element_located((By.ID, "ReportView_ReportToolbar_ExportGr_FormatList_DropDownList")))
+                    Select(dropdown).select_by_value("PDF")
+                    time.sleep(2)
+                    export_btn = driver.find_element(By.ID, "ReportView_ReportToolbar_ExportGr_Export")
+                    driver.execute_script("arguments[0].click();", export_btn)
+
+                    st.write("📥 Concluindo download do PDF...")
+                    time.sleep(wait_time_download)
+
+                    arquivos = [
+                        os.path.join(DOWNLOAD_TEMPORARIO, f)
+                        for f in os.listdir(DOWNLOAD_TEMPORARIO)
+                        if f.lower().endswith(".pdf")
+                    ]
+
+                    if arquivos:
+                        recente = max(arquivos, key=os.path.getctime)
+                        nome_pdf = (
+                            f"Relatorio_{status_sel.replace(' ', '_').replace('/','-')}_"
+                            f"{data_ini.replace('/','-')}_a_{data_fim.replace('/','-')}.pdf"
+                        )
+                        destino_pdf = os.path.join(PASTA_FINAL, nome_pdf)
+                        shutil.move(recente, destino_pdf)
+                        st.success(f"✅ PDF salvo: {destino_pdf}")
+
+                        st.write("📄 Extraindo Tabela — Atendimentos do PDF (modo textual)...")
+                        df_pdf = parse_pdf_to_atendimentos_df(destino_pdf, mode="text", debug=debug_parser)
+
+                        if not df_pdf.empty:
+                            df_pdf["Filtro_Negociacao"] = sanitize_value(negociacao)
+                            df_pdf["Filtro_Status"]     = sanitize_value(status_sel)
+                            df_pdf["Periodo_Inicio"]    = sanitize_value(data_ini)
+                            df_pdf["Periodo_Fim"]       = sanitize_value(data_fim)
+
+                            cols_show = TARGET_COLS
+                            missing = [c for c in cols_show if c not in df_pdf.columns]
+                            if missing:
+                                st.warning(f"As colunas {missing} não estavam presentes; exibindo todas as colunas retornadas para inspeção.")
+                                st.write("Colunas retornadas:", list(df_pdf.columns))
+                                st.dataframe(df_pdf, use_container_width=True)
+                            else:
+                                st.dataframe(df_pdf[cols_show], use_container_width=True)
+
+                            st.session_state.db_consolidado = pd.concat([st.session_state.db_consolidado, df_pdf], ignore_index=True)
+                            st.write(f"📊 Registros acumulados: {len(st.session_state.db_consolidado)}")
+                        else:
+                            st.warning("⚠️ Modo textual não conseguiu extrair linhas do PDF. Tente o modo TEXTO (sem PDF).")
+
+                        try:
+                            driver.switch_to.default_content()
+                        except Exception:
+                            pass
+                    else:
+                        st.error("❌ PDF não encontrado após o download. O SSRS pode ter demorado ou bloqueado.")
+                        try:
+                            driver.switch_to.default_content()
+                        except Exception:
+                            pass
 
             status.update(label="✅ Fim do processo!", state="complete")
 
