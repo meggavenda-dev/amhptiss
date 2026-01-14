@@ -8,70 +8,111 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import time
 
-# Configuração da página Streamlit
-st.set_page_config(page_title="Automação AMHP", layout="centered")
+# --- CONFIGURAÇÃO DA PÁGINA ---
+st.set_page_config(page_title="Automação AMHP", page_icon="🏥", layout="centered")
 
-def configurar_driver():
+# --- FUNÇÃO PARA CONFIGURAR O NAVEGADOR ---
+def iniciar_driver():
     options = Options()
-    options.add_argument("--headless") # Roda sem abrir janela (necessário para nuvem)
+    options.add_argument("--headless")  # Roda sem interface gráfica (obrigatório para nuvem)
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1920,1080")
     
     # Gerencia a instalação do driver automaticamente
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
     return driver
 
-st.title("🚀 Gerador de Relatórios AMHP")
-st.markdown("Insira seus dados para acessar o portal e o AMHPTISS.")
+# --- INTERFACE DO USUÁRIO ---
+st.title("🚀 Automação de Relatórios AMHP")
+st.info("Este programa realiza o login automático e acessa o portal AMHPTISS.")
 
-# Form de Login
-with st.form("login_form"):
-    user_input = st.text_input("Usuário / CPF")
-    pass_input = st.text_input("Senha", type="password")
-    submit_button = st.form_submit_button("Iniciar Automação")
+# Recuperando credenciais dos Secrets
+try:
+    USUARIO = st.secrets["credentials"]["usuario"]
+    SENHA = st.secrets["credentials"]["senha"]
+except KeyError:
+    st.error("⚠️ Erro: Credenciais não encontradas nos Secrets do Streamlit.")
+    st.stop()
 
-if submit_button:
-    if not user_input or not pass_input:
-        st.error("Por favor, preencha todos os campos.")
-    else:
-        driver = configurar_driver()
-        try:
-            with st.status("Executando passos...", expanded=True) as status:
-                # Passo 1: Login no Portal Principal
-                st.write("Acessando portal.amhp.com.br...")
-                driver.get("https://portal.amhp.com.br/")
-                
-                wait = WebDriverWait(driver, 20)
-                
-                st.write("Inserindo credenciais...")
-                campo_login = wait.until(EC.presence_of_element_located((By.ID, "input-9")))
-                campo_login.send_keys(user_input)
-                
-                campo_senha = driver.find_element(By.ID, "input-12")
-                campo_senha.send_keys(pass_input)
-                
-                botao_entrar = driver.find_element(By.XPATH, "//button[contains(., 'Entrar')]")
-                botao_entrar.click()
-                
-                # Passo 2: Transição
-                st.write("Aguardando autenticação...")
-                time.sleep(5) 
-                
-                # Passo 3: Acesso ao AMHPTISS
-                st.write("Navegando para AMHPTISS...")
-                driver.get("https://amhptiss.amhp.com.br/Default.aspx")
-                
-                # Verificação final
-                if "Default.aspx" in driver.current_url:
-                    st.success("Logado com sucesso no sistema TISS!")
-                    # Aqui você continuará com a lógica do relatório
-                else:
-                    st.error("Falha ao atingir a página final. Verifique o login.")
-                
-                status.update(label="Processo Concluído!", state="complete", expanded=False)
+if st.button("Iniciar Processamento"):
+    driver = iniciar_driver()
+    
+    try:
+        with st.status("Executando automação...", expanded=True) as status:
+            
+            # PASSO 1: Acessar Portal Principal
+            st.write("🌍 Acessando o portal AMHP...")
+            driver.get("https://portal.amhp.com.br/")
+            wait = WebDriverWait(driver, 25)
+            
+            # PASSO 2: Realizar Login
+            st.write("🔑 Inserindo credenciais...")
+            
+            # Localiza campo de login (ID input-9)
+            campo_login = wait.until(EC.presence_of_element_located((By.ID, "input-9")))
+            campo_login.send_keys(USUARIO)
+            
+            # Localiza campo de senha (ID input-12)
+            campo_senha = driver.find_element(By.ID, "input-12")
+            campo_senha.send_keys(SENHA)
+            
+            # Clica no botão Entrar
+            botao_entrar = driver.find_element(By.XPATH, "//button[contains(., 'Entrar')]")
+            botao_entrar.click()
+            
+            # PASSO 3: Aguardar Autenticação
+            st.write("⏳ Aguardando processamento do login...")
+            time.sleep(7) # Tempo de segurança para o redirecionamento do portal
+            
+            # PASSO 4: Navegar para AMHPTISS
+            st.write("📂 Acessando AMHPTISS...")
+            driver.get("https://amhptiss.amhp.com.br/Default.aspx")
+            
+            # Pequena espera para carregar a página ASPX
+            time.sleep(5)
+            
+            # PASSO 5: Verificação de Sucesso
+            url_atual = driver.current_url
+            if "amhptiss" in url_atual.lower():
+                st.success("✅ Sucesso! Você está dentro do AMHPTISS.")
+                st.write(f"**Página atual:** {url_atual}")
+                # Aqui você poderá adicionar os próximos cliques para gerar o relatório
+            else:
+                st.error("❌ Falha no redirecionamento. Verifique se o login foi bem-sucedido.")
+                # Tira um print caso dê erro para ajudar no debug
+                driver.save_screenshot("erro_login.png")
+                st.image("erro_login.png", caption="Tela de erro capturada")
 
-        except Exception as e:
-            st.error(f"Ocorreu um erro: {e}")
-        finally:
-            driver.quit()
+            status.update(label="Processo Finalizado!", state="complete", expanded=False)
+
+    except Exception as e:
+        st.error(f"🚨 Ocorreu um erro inesperado: {e}")
+    
+    finally:
+        driver.quit()
+
+---
+
+### Relembrando os arquivos auxiliares:
+
+Para que o código acima rode no **GitHub / Streamlit Cloud**, você **DEVE** ter esses dois arquivos no mesmo repositório:
+
+1.  **`requirements.txt`**:
+    ```text
+    streamlit
+    selenium
+    webdriver-manager
+    ```
+2.  **`packages.txt`**:
+    ```text
+    chromium-chromedriver
+    ```
+
+### Como testar agora:
+1. Suba os arquivos para o GitHub.
+2. No Streamlit Cloud, configure os **Secrets** com o `usuario` e `senha`.
+3. Clique no botão e veja se ele consegue chegar à página `Default.aspx`.
+
+**O próximo passo agora é o relatório: quando você está no `Default.aspx`, em qual menu você clica? Me descreva o caminho ou mande o código do botão de relatório para continuarmos.**
