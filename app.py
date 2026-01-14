@@ -144,6 +144,45 @@ re_total_blk  = re.compile(r"total\s*r\$\s*\d{1,3}(?:\.\d{3})*,\d{2}", re.I)
 def _normalize_ws2(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").replace("\u00A0", " ")).strip()
 
+# ---------- PRÉ-LIMPEZA ROBUSTA DO TEXTO (chave p/ dados “colados”) ----------
+def _preclean_report_text(raw: str) -> str:
+    """
+    - Corta preâmbulo (filtros) até o cabeçalho da tabela.
+    - Insere espaço entre Data e Hora quando coladas.
+    - Insere espaço entre Hora e o próximo token alfabético (Tipo de Guia) quando coladas.
+    - Normaliza whitespace.
+    """
+    if not raw:
+        return ""
+
+    txt = raw.replace("\u00A0", " ")
+    txt = _ILLEGAL_CTRL_RE.sub("", txt)
+
+    # 1) Corta tudo antes do cabeçalho da tabela (Atendimento… Valor Total)
+    # Busca um marcador robusto de início da grade
+    idx = None
+    m = re.search(r"(Atendimento\s*Nr\.?\s*Guia.*?Valor\s*Total)", txt, flags=re.I|re.S)
+    if m:
+        idx = m.start()
+    else:
+        # fallback: procure por primeira data dd/mm/yyyy seguida de hora e “Consulta|SP/SADT|Honorário|Não”
+        m2 = re.search(r"\d{2}/\d{2}/\d{4}\s*\d{2}:\d{2}\s*(Consulta|SP/SADT|Honorário|Não)", txt, flags=re.I)
+        if m2:
+            idx = max(0, m2.start()-30)
+    if idx is not None:
+        txt = txt[idx:]
+
+    # 2) Inserir espaço entre Data e Hora quando vierem coladas: 01/12/202508:43 -> 01/12/2025 08:43
+    txt = re.sub(r"(\d{2}/\d{2}/\d{4})(\d{2}:\d{2})", r"\1 \2", txt)
+
+    # 3) Inserir espaço entre Hora e próximo token alfabético (p.ex. “Consulta”, “SP/SADT”, “Honorário”, “Não”)
+    txt = re.sub(r"(\d{2}:\d{2})(?=[A-Za-zÁ-Úá-úNÇS/])", r"\1 ", txt)
+
+    # 4) Normalizar múltiplos espaços
+    txt = _normalize_ws2(txt)
+
+    return txt
+
 def is_mat_token(t: str) -> bool:
     # Matrícula: números ou alfanum com 5+ chars (cobre casos com X, ex.: 4X000300)
     if re.fullmatch(r"\d{5,}", t):
@@ -244,20 +283,27 @@ def parse_record_text(rec: str):
         "ValorTotal":   valor,
     }
 
-def parse_relatorio_text_to_atendimentos_df(texto: str) -> pd.DataFrame:
+def parse_relatorio_text_to_atendimentos_df(texto: str, debug_heads: bool = False) -> pd.DataFrame:
     """
     Parser principal para TODO o texto colado/obtido do ReportViewer.
 
+    Estratégia 0: PRÉ-LIMPEZA — insere espaços entre tokens críticos e corta o preâmbulo.
     Estratégia 1 (rápida): segmenta pelo VALOR e usa o 1º cabeçalho interno.
     Estratégia 2 (fallback streaming): encontra TODOS os cabeçalhos
        (Atendimento NrGuia dd/mm/yyyy hh:mm) e, para cada trecho,
-       usa o ÚLTIMO valor monetário para fechar a linha (funciona com tudo colado).
+       usa o ÚLTIMO valor monetário para fechar a linha.
     """
-    big = _normalize_ws2(texto)
+    big_raw = texto or ""
+    big = _preclean_report_text(big_raw)
     if not big:
         return pd.DataFrame(columns=TARGET_COLS)
 
     big = re_total_blk.sub("", big)
+
+    # Debug opcional: quantos cabeçalhos há no texto pré-limpado
+    if debug_heads:
+        heads_test = list(head_re.finditer(big))
+        st.caption(f"🧩 Cabeçalhos detectados (pré-limpeza): {len(heads_test)}")
 
     # ------------------ Estratégia 1: split por VALOR ------------------
     parts = re.split(rf"({val_re.pattern})", big)
@@ -292,6 +338,8 @@ def parse_relatorio_text_to_atendimentos_df(texto: str) -> pd.DataFrame:
 
     # ------------------ Estratégia 2: fallback STREAMING ------------------
     heads = list(head_re.finditer(big))
+    if debug_heads:
+        st.caption(f"🧩 Cabeçalhos detectados (streaming): {len(heads)}")
     if not heads:
         return pd.DataFrame(columns=TARGET_COLS)
 
@@ -534,7 +582,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool
                         if "nr" in t and "guia" in t:            return "NrGuia"
                         if "realiza" in t:                       return "Realizacao"
                         if "hora" in t:                          return "Hora"
-                        if "tipo" in t and "guia" in t:          return "TipoGuia"
+                        if "tipo" in t e "guia" in t:            return "TipoGuia"
                         if "operadora" in t:                     return "Operadora"
                         if "matr" in t:                          return "Matricula"
                         if "benef" in t:                         return "Beneficiario"
@@ -771,6 +819,7 @@ with st.sidebar:
         ["Texto (sem PDF) — recomendado", "PDF — exportar e tratar (legado)"]
     )
     debug_parser       = st.checkbox("🧪 Debug do parser PDF", value=False)
+    debug_heads        = st.checkbox("🧩 Mostrar contagem de cabeçalhos detectados (modo TEXTO)", value=True)
 
 # ========= (Opcional) Processar TEXTO manualmente =========
 with st.expander("🧪 Colar TEXTO do relatório (sem automação)", expanded=False):
@@ -779,7 +828,7 @@ with st.expander("🧪 Colar TEXTO do relatório (sem automação)", expanded=Fa
         if not texto_manual.strip():
             st.warning("Cole o texto do relatório e tente novamente.")
         else:
-            df_txt = parse_relatorio_text_to_atendimentos_df(texto_manual)
+            df_txt = parse_relatorio_text_to_atendimentos_df(texto_manual, debug_heads=debug_heads)
             if df_txt.empty:
                 st.error("Parser não conseguiu extrair linhas deste TEXTO.")
             else:
@@ -899,7 +948,7 @@ if st.button("🚀 Iniciar Processo"):
                         continue
 
                     st.write("📄 Processando TEXTO do relatório...")
-                    df_txt = parse_relatorio_text_to_atendimentos_df(texto_relatorio)
+                    df_txt = parse_relatorio_text_to_atendimentos_df(texto_relatorio, debug_heads=debug_heads)
 
                     if not df_txt.empty:
                         # Metadados
@@ -1029,4 +1078,3 @@ if not st.session_state.db_consolidado.empty:
     if st.button("🗑️ Limpar Banco Temporário"):
         st.session_state.db_consolidado = pd.DataFrame()
         st.rerun()
-
