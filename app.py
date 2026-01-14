@@ -269,18 +269,16 @@ if st.button("🚀 Iniciar Processo (PDF)"):
             safe_click(driver, By.XPATH, "//a[@href='AtendimentosRealizados.aspx']")
             time.sleep(3)
 
-            # 4.5) Seleção de credenciado (exemplo código 14406)
+            # 4.5) Seleção de credenciado pelo código
             credenciado_codigo = "14406"
-            cred_input = WebDriverWait(driver, 20).until(
-                EC.presence_of_element_located((By.ID, "ctl00_MainContent_rcbCredenciado_Input"))
-            )
+            cred_input = wait.until(EC.presence_of_element_located((By.ID, "ctl00_MainContent_rcbCredenciado_Input")))
             cred_input.clear()
             cred_input.send_keys(credenciado_codigo)
             time.sleep(1)
 
-            cred_li = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located(
-                    (By.XPATH, f"//li[contains(@class,'rcbHovered') and contains(text(),'{credenciado_codigo}')]")
+            cred_li = wait.until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, f"//li[contains(text(),'{credenciado_codigo}')]")
                 )
             )
             driver.execute_script("arguments[0].click();", cred_li)
