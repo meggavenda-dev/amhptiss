@@ -1,148 +1,107 @@
 
 # app.py
+import os
 import streamlit as st
 import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from pathlib import Path
+from datetime import datetime
+
+from automation.amhp import login_portal, access_amhptiss
+from automation.reports import open_reports_page, guess_export_button_name, guess_event_target_for_export, post_export, save_download_response
+
+# Config
+st.set_page_config(page_title="AMHP – HTTP Pura", page_icon="🔐", layout="centered")
+st.title("🔐 AMHP – Login HTTP Pura, acesso ao AMHPTISS e download de relatórios")
 
 PORTAL_URL = "https://portal.amhp.com.br/"
 AMHPTISS_URL = "https://amhptiss.amhp.com.br/Default.aspx"
 
-st.set_page_config(page_title="AMHP – HTTP Login", page_icon="🔐", layout="centered")
-st.title("🔐 AMHP – Login HTTP Puro e acesso ao AMHPTISS")
+# Exemplos: ajuste para a página real de relatórios
+DEFAULT_REPORTS_PAGE = "https://amhptiss.amhp.com.br/Relatorios/ProducaoMensal.aspx"  # AJUSTE AQUI
 
-# --- Utilitários ASP.NET ---
-def extract_aspnet_tokens(html_text):
-    """Extrai __VIEWSTATE, __EVENTVALIDATION e __VIEWSTATEGENERATOR se existirem."""
-    soup = BeautifulSoup(html_text, "html.parser")
-    tokens = {}
-    for name in ["__VIEWSTATE", "__EVENTVALIDATION", "__VIEWSTATEGENERATOR"]:
-        tag = soup.find("input", {"name": name})
-        tokens[name] = tag["value"] if tag and tag.has_attr("value") else None
-    return tokens, soup
+# Credenciais via secrets ou inputs
+user_default = st.secrets.get("AMHP_USER", "")
+pass_default = st.secrets.get("AMHP_PASS", "")
 
-def find_login_fields(soup):
-    """
-    Descobre nomes dos campos de usuário, senha e botão no formulário de login,
-    de forma heurística. Ajuste se souber os IDs exatos.
-    """
-    text_inputs = soup.find_all("input", {"type": "text"})
-    pass_inputs = soup.find_all("input", {"type": "password"})
-    submit_inputs = soup.find_all("input", {"type": "submit"}) + soup.find_all("button", {"type": "submit"})
-
-    # Heurísticas por id/name/placeholder/label
-    def candidate_username():
-        for inp in text_inputs:
-            txt = " ".join([inp.get("id",""), inp.get("name",""), inp.get("placeholder","")]).lower()
-            if any(k in txt for k in ["usuario", "usuário", "login", "cpf", "email", "e-mail"]):
-                return inp.get("name") or inp.get("id")
-        # fallback: primeiro input text
-        return text_inputs[0].get("name") if text_inputs else None
-
-    def candidate_password():
-        for inp in pass_inputs:
-            txt = " ".join([inp.get("id",""), inp.get("name",""), inp.get("placeholder","")]).lower()
-            if any(k in txt for k in ["senha", "password"]):
-                return inp.get("name") or inp.get("id")
-        return pass_inputs[0].get("name") if pass_inputs else None
-
-    def candidate_submit_name_value():
-        # retorna (name, value) para input/button de submit
-        for inp in submit_inputs:
-            nm = inp.get("name")
-            val = inp.get("value","Entrar")
-            txt = " ".join([inp.get("id",""), nm or "", val]).lower()
-            if any(k in txt for k in ["entrar","acessar","login","ok","submit"]):
-                return nm, val
-        # fallback: se não há submit explícito, alguns ASP.NET disparam post via JS; use None
-        return None, None
-
-    return candidate_username(), candidate_password(), candidate_submit_name_value()
-
-def login_portal(session: requests.Session, username: str, password: str, timeout=30):
-    """Executa GET no login (para tokens) e POST com credenciais."""
-    # 1) GET portal
-    r_get = session.get(PORTAL_URL, timeout=timeout)
-    if r_get.status_code != 200:
-        return False, "Falha ao abrir portal (GET).", r_get
-
-    tokens, soup = extract_aspnet_tokens(r_get.text)
-    user_field, pass_field, (submit_name, submit_value) = find_login_fields(soup)
-
-    if not user_field or not pass_field:
-        return False, "Não identifiquei campos de usuário/senha. Ajuste find_login_fields().", r_get
-
-    # 2) Monta payload do POST
-    payload = {
-        user_field: username,
-        pass_field: password,
-    }
-    # ASP.NET tokens
-    for k, v in tokens.items():
-        if v is not None:
-            payload[k] = v
-    # Botão de submit se existir name
-    if submit_name:
-        payload[submit_name] = submit_value or "Entrar"
-
-    # 3) POST ao mesmo endpoint (alguns portais têm action diferente; se houver form action, use urljoin)
-    form = soup.find("form")
-    action_url = PORTAL_URL
-    if form and form.get("action"):
-        action_url = urljoin(PORTAL_URL, form.get("action"))
-    r_post = session.post(action_url, data=payload, timeout=timeout, allow_redirects=True)
-
-    # 4) Heurística de login OK
-    html_lower = r_post.text.lower()
-    ok = (
-        ("sair" in html_lower or "logoff" in html_lower or "minha conta" in html_lower) or
-        ("senha" not in html_lower and "usuário" not in html_lower and "usuario" not in html_lower and "login" not in html_lower)
-    )
-    return ok, None if ok else "Falha no login (credenciais ou fluxo).", r_post
-
-def access_amhptiss(session: requests.Session, timeout=30):
-    """Tenta acessar AMHPTISS com a mesma sessão."""
-    r = session.get(AMHPTISS_URL, timeout=timeout, allow_redirects=True)
-    html_lower = r.text.lower()
-    # Sucesso simples: não mostrou tela de login
-    success = ("login" not in html_lower and "senha" not in html_lower)
-    return success, r
-
-# --- UI ---
 with st.form("login_form"):
-    col1, col2 = st.columns(2)
-    with col1:
-        user = st.text_input("Usuário")
-    with col2:
-        pwd = st.text_input("Senha", type="password")
-    submit = st.form_submit_button("Fazer login e abrir AMHPTISS")
+    c1, c2 = st.columns(2)
+    with c1:
+        username = st.text_input("Usuário", value=user_default)
+    with c2:
+        password = st.text_input("Senha", value=pass_default, type="password")
+    devmode = st.checkbox("Modo desenvolvedor (mostrar HTML bruto)", value=False)
+    submit_login = st.form_submit_button("Fazer login")
 
-if submit:
-    if not user or not pwd:
-        st.error("Informe usuário e senha.")
+if submit_login:
+    if not username or not password:
+        st.error("Informe usuário e senha (ou configure em `.streamlit/secrets.toml`).")
         st.stop()
 
-    # Sessão HTTP
     sess = requests.Session()
-    # Header básico (User-Agent) ajuda em alguns portais
-    sess.headers.update({"User-Agent": "Mozilla/5.0 (Streamlit/HTTP automation)"})
+    sess.headers.update({"User-Agent": "Mozilla/5.0 (Streamlit/HTTP)"})
 
-    ok, reason, r_login = login_portal(sess, user.strip(), pwd.strip())
-    with st.expander("Resposta do login (HTML bruto)"):
-        st.code(r_login.text[:5000], language="html")
-
+    ok, r_post, reason = login_portal(sess, username.strip(), password.strip())
     if not ok:
-        st.error(f"❌ {reason or 'Falha no login.'}")
+        st.error(reason or "Falha no login.")
+        if devmode:
+            with st.expander("HTML Login (trecho)"):
+                st.code(r_post.text[:5000], language="html")
         st.stop()
 
     st.success("✅ Login realizado no Portal AMHP.")
-    # Tenta abrir AMHPTISS
-    tiss_ok, r_tiss = access_amhptiss(sess)
-    if tiss_ok:
-        st.success(f"✅ AMHPTISS acessado. URL final: {r_tiss.url}")
-        with st.expander("HTML AMHPTISS (trecho)"):
-            st.code(r_tiss.text[:5000], language="html")
+    ok_tiss, r_tiss = access_amhptiss(sess)
+    if ok_tiss:
+        st.success(f"✅ AMHPTISS acessado. URL: {r_tiss.url}")
     else:
-        st.warning("ℹ️ AMHPTISS não confirmou sessão. Pode exigir clique/menu/SSO interno.")
+        st.warning("ℹ️ AMHPTISS não confirmou sessão; pode exigir clique/SSO.")
+    if devmode:
         with st.expander("HTML AMHPTISS (trecho)"):
             st.code(r_tiss.text[:5000], language="html")
+
+    # ---- Download de relatório (HTTP pura) ----
+    st.markdown("---")
+    st.subheader("📄 Baixar relatório")
+    reports_page_url = st.text_input("URL da página de relatório", value=DEFAULT_REPORTS_PAGE)
+
+    c3, c4 = st.columns(2)
+    with c3:
+        mes = st.selectbox("Mês", [f"{i:02d}" for i in range(1,13)], index=datetime.now().month-1)
+    with c4:
+        ano = st.text_input("Ano", value=str(datetime.now().year))
+
+    # Names padrão (AJUSTE conforme HTML real)
+    # Ex.: ctl00$MainContent$cmbMes / ctl00$MainContent$cmbAno
+    periodo_names = {
+        "ctl00$MainContent$cmbMes": mes,
+        "ctl00$MainContent$cmbAno": ano,
+    }
+
+    if st.button("Gerar/Exportar"):
+        try:
+            tokens, soup, action_url = open_reports_page(sess, reports_page_url)
+            submit_name = guess_export_button_name(soup)
+            event_target = None if submit_name else guess_event_target_for_export(soup)
+
+            r_export = post_export(
+                session=sess,
+                action_url=action_url,
+                tokens=tokens,
+                period_params=periodo_names,
+                submit_name=submit_name,
+                event_target=event_target,
+            )
+
+            out_dir = Path("reports") / datetime.now().strftime("%Y-%m")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_file = out_dir / f"relatorio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"  # ajuste extensão se necessário
+
+            saved = save_download_response(sess, r_export, action_url, out_file)
+            st.success(f"✅ Relatório salvo em: {saved}")
+            with open(saved, "rb") as f:
+                st.download_button("Baixar relatório", data=f.read(), file_name=saved.name)
+
+            if devmode:
+                st.info(f"submit_name: {submit_name} | event_target: {event_target}")
+
+        except Exception as e:
+            st.error(f"❌ Falha ao baixar relatório: {e}")
