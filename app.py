@@ -16,7 +16,6 @@ def iniciar_driver():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
-    # Identidade visual de navegador comum
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
     service = Service("/usr/bin/chromedriver")
@@ -25,76 +24,73 @@ def iniciar_driver():
     except:
         return webdriver.Chrome(options=options)
 
-st.title("🏥 Automação AMHP")
+st.title("🏥 Automação AMHP - Atendimentos")
 
-# Pegando dados dos Secrets
 USUARIO = st.secrets["credentials"]["usuario"]
 SENHA = st.secrets["credentials"]["senha"]
 
-if st.button("🚀 Iniciar Acesso ao TISS"):
+if st.button("🚀 Iniciar Relatório"):
     driver = iniciar_driver()
     if driver:
         try:
-            with st.status("Realizando acesso...", expanded=True) as status:
+            with st.status("Iniciando processo...", expanded=True) as status:
                 
-                # 1. LOGIN NO PORTAL
-                st.write("🌐 Abrindo portal principal...")
+                # 1. LOGIN E TRANSIÇÃO
+                st.write("🌐 Fazendo login no Portal...")
                 driver.get("https://portal.amhp.com.br/")
                 wait = WebDriverWait(driver, 30)
-
-                st.write("🔑 Preenchendo login...")
-                campo_login = wait.until(EC.element_to_be_clickable((By.ID, "input-9")))
-                campo_login.send_keys(USUARIO)
                 
-                campo_senha = driver.find_element(By.ID, "input-12")
-                campo_senha.send_keys(SENHA)
-                campo_senha.send_keys(Keys.ENTER)
+                wait.until(EC.presence_of_element_located((By.ID, "input-9"))).send_keys(USUARIO)
+                driver.find_element(By.ID, "input-12").send_keys(SENHA + Keys.ENTER)
 
-                # 2. ESPERA O DASHBOARD CARREGAR
-                st.write("⏳ Aguardando carregamento do portal logado...")
                 time.sleep(12) 
-
-                # 3. CLIQUE NO BOTÃO AMHPTISS (USANDO O CÓDIGO QUE VOCÊ PASSOU)
-                st.write("🖱️ Localizando botão AMHPTISS...")
-                try:
-                    # Buscamos especificamente pela classe e texto que você enviou
-                    botao_tiss = wait.until(EC.element_to_be_clickable(
-                        (By.XPATH, "//button[contains(@class, 'botao-sombreado') and contains(., 'AMHPTISS')]")
-                    ))
-                    st.write("✅ Botão AMHPTISS encontrado! Clicando...")
-                    driver.execute_script("arguments[0].click();", botao_tiss)
-                    
-                except Exception as e:
-                    st.warning("Não achei o botão pela classe. Tentando busca geral por texto...")
-                    botao_alt = driver.find_element(By.XPATH, "//button[contains(., 'AMHPTISS')]")
-                    driver.execute_script("arguments[0].click();", botao_alt)
-
-                # 4. AGUARDAR TRANSIÇÃO DE SISTEMA
-                st.write("🔄 Transferindo sessão para o TISS...")
-                time.sleep(10)
-
-                # Se o sistema abrir em uma nova aba, trocamos para ela
+                
+                st.write("🖱️ Acessando AMHPTISS...")
+                botao_tiss = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'AMHPTISS')]")))
+                driver.execute_script("arguments[0].click();", botao_tiss)
+                
+                time.sleep(8)
                 if len(driver.window_handles) > 1:
                     driver.switch_to.window(driver.window_handles[1])
 
-                # 5. VERIFICAÇÃO FINAL
-                url_final = driver.current_url
-                st.write(f"📍 Chegamos em: {url_final}")
+                # 2. TRATAR INFORMATIVO
+                try:
+                    btn_fechar = WebDriverWait(driver, 7).until(EC.element_to_be_clickable((By.ID, "fechar-informativo")))
+                    driver.execute_script("arguments[0].click();", btn_fechar)
+                    st.write("✅ Informativo fechado.")
+                except:
+                    st.write("ℹ️ Sem informativo.")
+
+                # 3. NAVEGAÇÃO DETALHADA
+                st.write("📂 Navegando: Ir Para > Consultório > Atendimentos...")
+
+                # Passo A: Clicar em "Ir Para"
+                ir_para = wait.until(EC.element_to_be_clickable((By.ID, "IrPara")))
+                driver.execute_script("arguments[0].click();", ir_para)
+                time.sleep(2)
+
+                # Passo B: Clicar em "Consultório" (Usando a classe rtIn que você passou)
+                consultorio = wait.until(EC.element_to_be_clickable((By.XPATH, "//span[@class='rtIn' and contains(text(), 'Consultório')]")))
+                driver.execute_script("arguments[0].click();", consultorio)
+                time.sleep(2)
+
+                # Passo C: Clicar em "Atendimentos Realizados"
+                atendimentos = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[@href='AtendimentosRealizados.aspx']")))
+                driver.execute_script("arguments[0].click();", atendimentos)
                 
-                driver.save_screenshot("captura_tiss.png")
-                st.image("captura_tiss.png", caption="Tela atual do AMHPTISS")
+                # 4. FINALIZAÇÃO
+                st.write("⏳ Carregando tela de relatório...")
+                time.sleep(7)
+                
+                st.success(f"📍 Chegamos! Página: {driver.title}")
+                driver.save_screenshot("tela_final.png")
+                st.image("tela_final.png", caption="Tela de Atendimentos Realizados")
 
-                if "amhptiss" in url_final.lower():
-                    st.success("✅ SUCESSO! Você está dentro do AMHPTISS.")
-                    st.balloons()
-                else:
-                    st.error("❌ O redirecionamento falhou. O sistema parou fora do TISS.")
-
-                status.update(label="Fluxo Finalizado", state="complete", expanded=False)
+                status.update(label="Navegação Concluída!", state="complete", expanded=False)
 
         except Exception as e:
-            st.error(f"🚨 Erro: {e}")
-            driver.save_screenshot("erro_final.png")
-            st.image("erro_final.png")
+            st.error(f"🚨 Erro na navegação: {e}")
+            driver.save_screenshot("erro_nav.png")
+            st.image("erro_nav.png")
         finally:
             driver.quit()
