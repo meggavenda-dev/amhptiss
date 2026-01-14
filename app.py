@@ -1,4 +1,5 @@
 import streamlit as st
+import pandas as pd
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -7,156 +8,195 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 import time
 import os
+import re
 import shutil
 
-# --- CONFIGURAÇÃO DE CAMINHOS ---
-def obter_caminho_final():
-    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-    if os.path.exists(desktop):
-        path = os.path.join(desktop, "automacao_excel")
-    else:
-        path = os.path.join(os.getcwd(), "automacao_excel")
-    if not os.path.exists(path): os.makedirs(path)
-    return path
+# --- CONFIGURAÇÃO DA PÁGINA ---
+st.set_page_config(page_title="AMHP Data Analytics", layout="wide")
 
-PASTA_FINAL = obter_caminho_final()
-DOWNLOAD_TEMPORARIO = os.path.join(os.getcwd(), "temp_downloads")
-if not os.path.exists(DOWNLOAD_TEMPORARIO): os.makedirs(DOWNLOAD_TEMPORARIO)
+if 'db_consolidado' not in st.session_state:
+    st.session_state.db_consolidado = pd.DataFrame()
 
+# Diretório para downloads (Funciona no Streamlit Cloud)
+DOWNLOAD_DIR = os.path.join(os.getcwd(), "temp_downloads")
+
+def preparar_pasta():
+    if os.path.exists(DOWNLOAD_DIR):
+        shutil.rmtree(DOWNLOAD_DIR)
+    os.makedirs(DOWNLOAD_DIR)
+
+# --- FUNÇÃO DE PROCESSAMENTO XLS (BIBLIOTECA XLRD) ---
+def processar_xls_amhp(caminho_arquivo, status_nome, neg_nome):
+    """Lê arquivos XLS binários e sanitiza os dados para o Pandas"""
+    try:
+        import xlrd
+        workbook = xlrd.open_workbook(caminho_arquivo)
+        sheet = workbook.sheet_by_index(0)
+        dados_brutos = [sheet.row_values(i) for i in range(sheet.nrows)]
+        df_temp = pd.DataFrame(dados_brutos)
+
+        # Localiza o cabeçalho real
+        idx_cabecalho = -1
+        for i, linha in df_temp.iterrows():
+            linha_str = " ".join([str(v) for v in linha.values])
+            if "Atendimento" in linha_str and "Guia" in linha_str:
+                idx_cabecalho = i
+                break
+        
+        if idx_cabecalho == -1: return False
+
+        # Define cabeçalhos e limpa colunas vazias
+        df = df_temp.iloc[idx_cabecalho+1:].copy()
+        df.columns = df_temp.iloc[idx_cabecalho]
+        df = df.loc[:, df.columns.notnull()].dropna(how='all', axis=0)
+        
+        # REMOVE CARACTERES ILEGAIS (Regex para evitar erro de download no Streamlit)
+        df = df.applymap(lambda x: re.sub(r'[^\x20-\x7E\xA0-\xFF]', '', str(x)) if pd.notnull(x) else x)
+        
+        df['Filtro_Status'] = status_nome
+        df['Filtro_Negociacao'] = neg_nome
+        
+        st.session_state.db_consolidado = pd.concat([st.session_state.db_consolidado, df], ignore_index=True)
+        return True
+    except Exception as e:
+        st.error(f"Erro no processamento dos dados: {e}")
+        return False
+
+# --- CONFIGURAÇÃO DO NAVEGADOR ---
 def iniciar_driver():
-    options = Options()
-    options.add_argument("--headless") 
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1920,1080")
+    opts = Options()
+    opts.add_argument("--headless")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1920,1080")
     
     prefs = {
-        "download.default_directory": DOWNLOAD_TEMPORARIO,
+        "download.default_directory": DOWNLOAD_DIR,
         "download.prompt_for_download": False,
-        "download.directory_upgrade": True,
         "safebrowsing.enabled": True
     }
-    options.add_experimental_option("prefs", prefs)
-    return webdriver.Chrome(options=options)
+    opts.add_experimental_option("prefs", prefs)
+    return webdriver.Chrome(options=opts)
 
-st.title("🏥 Exportador AMHP - Versão Estável")
+# --- INTERFACE ---
+st.title("🏥 Consolidador AMHP - Versão Estável")
 
-col1, col2 = st.columns(2)
-with col1: data_ini = st.text_input("📅 Data Inicial", value="01/01/2026")
-with col2: data_fim = st.text_input("📅 Data Final", value="13/01/2026")
+with st.sidebar:
+    st.header("Parâmetros")
+    data_ini = st.text_input("📅 Data Inicial", value="01/01/2026")
+    data_fim = st.text_input("📅 Data Final", value="13/01/2026")
+    status_filtro = "300 - Pronto para Processamento"
+    neg_filtro = "Direto"
 
-if st.button("🚀 Iniciar Processo"):
+if st.button("🚀 Iniciar Robô"):
+    preparar_pasta()
     driver = iniciar_driver()
-    if driver:
-        try:
-            with st.status("Trabalhando...", expanded=True) as status:
-                wait = WebDriverWait(driver, 35)
-                
-                # 1. LOGIN
-                driver.get("https://portal.amhp.com.br/")
-                wait.until(EC.presence_of_element_located((By.ID, "input-9"))).send_keys(st.secrets["credentials"]["usuario"])
-                driver.find_element(By.ID, "input-12").send_keys(st.secrets["credentials"]["senha"] + Keys.ENTER)
-                time.sleep(12)
-                
-                # 2. ENTRAR NO AMHPTISS
-                st.write("🔄 Acessando TISS...")
-                btn_tiss = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'AMHPTISS')]")))
-                driver.execute_script("arguments[0].click();", btn_tiss)
-                time.sleep(10)
-                if len(driver.window_handles) > 1: driver.switch_to.window(driver.window_handles[1])
+    
+    try:
+        with st.status("Executando automação...", expanded=True) as status:
+            wait = WebDriverWait(driver, 40)
+            
+            # 1. LOGIN
+            driver.get("https://portal.amhp.com.br/")
+            wait.until(EC.presence_of_element_located((By.ID, "input-9"))).send_keys(st.secrets["credentials"]["usuario"])
+            driver.find_element(By.ID, "input-12").send_keys(st.secrets["credentials"]["senha"] + Keys.ENTER)
+            
+            # 2. ENTRAR NO AMHPTISS
+            st.write("🔄 Acessando sistema TISS...")
+            time.sleep(12)
+            btn_tiss = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'AMHPTISS')]")))
+            driver.execute_script("arguments[0].click();", btn_tiss)
+            
+            # Troca de Aba (Essencial para não dar erro)
+            time.sleep(10)
+            if len(driver.window_handles) > 1:
+                driver.switch_to.window(driver.window_handles[-1])
 
-                # 3. LIMPEZA DE BLOQUEIOS (Pop-ups e Overlays)
-                st.write("🧹 Limpando tela...")
-                # Tenta fechar o informativo
-                try:
-                    btn_fechar = wait.until(EC.element_to_be_clickable((By.ID, "fechar-informativo")))
-                    driver.execute_script("arguments[0].click();", btn_fechar)
-                    time.sleep(2)
-                except: pass
+            # 3. LIMPEZA DE OVERLAYS (Remove bloqueios centrais)
+            st.write("🧹 Limpando pop-ups...")
+            driver.execute_script("""
+                var blockers = document.querySelectorAll('center, .loading, .overlay, #fechar-informativo');
+                blockers.forEach(el => { el.style.display = 'none'; el.style.pointerEvents = 'none'; });
+            """)
+            try:
+                driver.find_element(By.ID, "fechar-informativo").click()
+            except: pass
 
-                # Remove qualquer elemento <center> que possa estar bloqueando (causa do erro anterior)
-                driver.execute_script("""
-                    var overlays = document.querySelectorAll('center, .loading, .overlay');
-                    for (var i = 0; i < overlays.length; i++) {
-                        overlays[i].style.display = 'none';
-                        overlays[i].style.pointerEvents = 'none';
-                    }
-                """)
+            # 4. NAVEGAÇÃO VIA JAVASCRIPT
+            st.write("📂 Abrindo menus...")
+            ir_para = wait.until(EC.presence_of_element_located((By.ID, "IrPara")))
+            driver.execute_script("arguments[0].click();", ir_para)
+            
+            cons = wait.until(EC.presence_of_element_located((By.XPATH, "//span[contains(text(), 'Consultório')]")))
+            driver.execute_script("arguments[0].click();", cons)
+            
+            atend = wait.until(EC.presence_of_element_located((By.XPATH, "//a[@href='AtendimentosRealizados.aspx']")))
+            driver.execute_script("arguments[0].click();", atend)
+            
+            # 5. FILTROS
+            st.write("📝 Preenchendo critérios...")
+            # Negociação e Status
+            input_neg = wait.until(EC.presence_of_element_located((By.ID, "ctl00_MainContent_rcbTipoNegociacao_Input")))
+            input_neg.send_keys(neg_filtro + Keys.ENTER)
+            time.sleep(2)
+            
+            input_stat = wait.until(EC.presence_of_element_located((By.ID, "ctl00_MainContent_rcbStatus_Input")))
+            input_stat.send_keys(status_filtro + Keys.ENTER)
+            time.sleep(2)
+            
+            # Datas
+            driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataInicio_dateInput").send_keys(data_ini + Keys.TAB)
+            driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataFim_dateInput").send_keys(data_fim + Keys.TAB)
 
-                # 4. NAVEGAÇÃO (Usando clique forçado via JS)
-                st.write("📂 Abrindo menu...")
-                ir_para = wait.until(EC.presence_of_element_located((By.ID, "IrPara")))
-                driver.execute_script("arguments[0].click();", ir_para)
-                time.sleep(2)
+            # 6. EXPORTAÇÃO
+            st.write("🔍 Gerando relatório...")
+            btn_buscar = driver.find_element(By.ID, "ctl00_MainContent_btnBuscar_input")
+            driver.execute_script("arguments[0].click();", btn_buscar)
+            
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".rgMasterTable")))
+            driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "ctl00_MainContent_rdgAtendimentosRealizados_ctl00_ctl02_ctl00_SelectColumnSelectCheckBox"))
+            time.sleep(3)
+            driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "ctl00_MainContent_rbtImprimirAtendimentos_input"))
+            
+            # Iframe de download
+            time.sleep(15)
+            if len(driver.find_elements(By.TAG_NAME, "iframe")) > 0:
+                driver.switch_to.frame(0)
+            
+            dropdown = wait.until(EC.presence_of_element_located((By.ID, "ReportView_ReportToolbar_ExportGr_FormatList_DropDownList")))
+            Select(dropdown).select_by_value("XLS")
+            time.sleep(2)
+            driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "ReportView_ReportToolbar_ExportGr_Export"))
+            
+            st.write("📥 Baixando e processando arquivo binário...")
+            time.sleep(25)
 
-                consultorio = wait.until(EC.presence_of_element_located((By.XPATH, "//span[@class='rtIn' and contains(text(), 'Consultório')]")))
-                driver.execute_script("arguments[0].click();", consultorio)
-                time.sleep(2)
+            # 7. PROCESSAMENTO FINAL
+            arquivos = [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR) if f.endswith('.xls')]
+            if arquivos:
+                recente = max(arquivos, key=os.path.getctime)
+                if processar_xls_amhp(recente, status_filtro, neg_filtro):
+                    st.success("✅ Relatório consolidado na base de dados!")
+                os.remove(recente)
+            else:
+                st.error("Arquivo não encontrado. O download pode ter falhado.")
 
-                atendimentos = wait.until(EC.presence_of_element_located((By.XPATH, "//a[@href='AtendimentosRealizados.aspx']")))
-                driver.execute_script("arguments[0].click();", atendimentos)
-                time.sleep(5)
+            status.update(label="Processo Concluído!", state="complete")
+            
+    except Exception as e:
+        st.error(f"Erro Crítico: {e}")
+    finally:
+        driver.quit()
 
-                # 5. FILTROS
-                st.write("📝 Preenchendo campos...")
-                # Negociação
-                neg = wait.until(EC.presence_of_element_located((By.ID, "ctl00_MainContent_rcbTipoNegociacao_Input")))
-                driver.execute_script("arguments[0].value = 'Direto';", neg)
-                neg.send_keys(Keys.ENTER)
-                time.sleep(2)
-
-                # Status
-                stat = wait.until(EC.presence_of_element_located((By.ID, "ctl00_MainContent_rcbStatus_Input")))
-                driver.execute_script("arguments[0].value = '300 - Pronto para Processamento';", stat)
-                stat.send_keys(Keys.ENTER)
-                time.sleep(2)
-                
-                # Datas
-                d_ini = driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataInicio_dateInput")
-                d_ini.send_keys(data_ini + Keys.TAB)
-                d_fim = driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataFim_dateInput")
-                d_fim.send_keys(data_fim + Keys.TAB)
-
-                # 6. BUSCAR E EXPORTAR
-                st.write("🔍 Gerando relatório...")
-                btn_buscar = driver.find_element(By.ID, "ctl00_MainContent_btnBuscar_input")
-                driver.execute_script("arguments[0].click();", btn_buscar)
-                
-                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".rgMasterTable")))
-                driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "ctl00_MainContent_rdgAtendimentosRealizados_ctl00_ctl02_ctl00_SelectColumnSelectCheckBox"))
-                time.sleep(4)
-                
-                driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "ctl00_MainContent_rbtImprimirAtendimentos_input"))
-                time.sleep(15)
-
-                # Troca para Iframe e Exporta
-                iframes = driver.find_elements(By.TAG_NAME, "iframe")
-                if len(iframes) > 0: driver.switch_to.frame(0)
-
-                dropdown = wait.until(EC.presence_of_element_located((By.ID, "ReportView_ReportToolbar_ExportGr_FormatList_DropDownList")))
-                Select(dropdown).select_by_value("XLS")
-                time.sleep(2)
-                driver.execute_script("arguments[0].click();", driver.find_element(By.ID, "ReportView_ReportToolbar_ExportGr_Export"))
-                
-                st.write("📥 Concluindo download...")
-                time.sleep(15)
-
-                # ORGANIZAÇÃO FINAL
-                arquivos = os.listdir(DOWNLOAD_TEMPORARIO)
-                if arquivos:
-                    recente = max([os.path.join(DOWNLOAD_TEMPORARIO, f) for f in arquivos], key=os.path.getctime)
-                    nome_f = f"Relatorio_300_Direto_{data_ini.replace('/','-')}.xls"
-                    destino = os.path.join(PASTA_FINAL, nome_f)
-                    shutil.move(recente, destino)
-                    st.success(f"✅ Salvo em: {destino}")
-                else:
-                    st.error("Arquivo não encontrado.")
-
-                status.update(label="Fim!", state="complete")
-
-        except Exception as e:
-            st.error(f"Erro detectado: {e}")
-            driver.save_screenshot("erro_interceptado.png")
-            st.image("erro_interceptado.png")
-        finally:
-            driver.quit()
+# --- EXIBIÇÃO E DOWNLOAD ---
+if not st.session_state.db_consolidado.empty:
+    st.divider()
+    st.subheader("📊 Base Consolidada")
+    st.dataframe(st.session_state.db_consolidado)
+    
+    csv = st.session_state.db_consolidado.to_csv(index=False, sep=';', encoding='utf-8-sig').encode('utf-8-sig')
+    st.download_button("💾 Baixar Resultados (Excel/CSV)", csv, "relatorio_amhp_unificado.csv", "text/csv")
+    
+    if st.button("🗑️ Limpar Memória"):
+        st.session_state.db_consolidado = pd.DataFrame()
+        st.rerun()
