@@ -8,7 +8,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 import time
 
-st.set_page_config(page_title="Automação AMHPTISS", layout="wide")
+st.set_page_config(page_title="Automação AMHP", layout="wide")
 
 def iniciar_driver():
     options = Options()
@@ -16,8 +16,7 @@ def iniciar_driver():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
-    # Tenta mascarar o uso de automação
-    options.add_argument("--disable-blink-features=AutomationControlled")
+    # Identidade visual de navegador comum
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
     service = Service("/usr/bin/chromedriver")
@@ -26,23 +25,24 @@ def iniciar_driver():
     except:
         return webdriver.Chrome(options=options)
 
-st.title("🏥 Acesso AMHPTISS")
+st.title("🏥 Automação AMHP")
 
+# Pegando dados dos Secrets
 USUARIO = st.secrets["credentials"]["usuario"]
 SENHA = st.secrets["credentials"]["senha"]
 
-if st.button("🚀 Iniciar Acesso"):
+if st.button("🚀 Iniciar Acesso ao TISS"):
     driver = iniciar_driver()
     if driver:
         try:
-            with st.status("Autenticando...", expanded=True) as status:
+            with st.status("Realizando acesso...", expanded=True) as status:
                 
-                # 1. Login
-                st.write("🌐 Abrindo portal...")
+                # 1. LOGIN NO PORTAL
+                st.write("🌐 Abrindo portal principal...")
                 driver.get("https://portal.amhp.com.br/")
                 wait = WebDriverWait(driver, 30)
 
-                st.write("🔑 Digitante credenciais...")
+                st.write("🔑 Preenchendo login...")
                 campo_login = wait.until(EC.element_to_be_clickable((By.ID, "input-9")))
                 campo_login.send_keys(USUARIO)
                 
@@ -50,44 +50,51 @@ if st.button("🚀 Iniciar Acesso"):
                 campo_senha.send_keys(SENHA)
                 campo_senha.send_keys(Keys.ENTER)
 
-                # 2. ESPERA CRUCIAL
-                st.write("⏳ Aguardando consolidação da sessão no portal principal...")
-                time.sleep(15) 
+                # 2. ESPERA O DASHBOARD CARREGAR
+                st.write("⏳ Aguardando carregamento do portal logado...")
+                time.sleep(12) 
 
-                # 3. VERIFICAÇÃO DE COOKIES E ACESSO AO TISS
-                st.write("📂 Solicitando AMHPTISS...")
-                
-                # Antes de dar o GET, vamos limpar qualquer redirecionamento pendente
-                driver.execute_script("window.location.href = 'https://amhptiss.amhp.com.br/Default.aspx'")
-                
-                # Espera o sistema TISS carregar (ele é lento)
-                time.sleep(12)
+                # 3. CLIQUE NO BOTÃO AMHPTISS (USANDO O CÓDIGO QUE VOCÊ PASSOU)
+                st.write("🖱️ Localizando botão AMHPTISS...")
+                try:
+                    # Buscamos especificamente pela classe e texto que você enviou
+                    botao_tiss = wait.until(EC.element_to_be_clickable(
+                        (By.XPATH, "//button[contains(@class, 'botao-sombreado') and contains(., 'AMHPTISS')]")
+                    ))
+                    st.write("✅ Botão AMHPTISS encontrado! Clicando...")
+                    driver.execute_script("arguments[0].click();", botao_tiss)
+                    
+                except Exception as e:
+                    st.warning("Não achei o botão pela classe. Tentando busca geral por texto...")
+                    botao_alt = driver.find_element(By.XPATH, "//button[contains(., 'AMHPTISS')]")
+                    driver.execute_script("arguments[0].click();", botao_alt)
 
-                # 4. RESULTADO
+                # 4. AGUARDAR TRANSIÇÃO DE SISTEMA
+                st.write("🔄 Transferindo sessão para o TISS...")
+                time.sleep(10)
+
+                # Se o sistema abrir em uma nova aba, trocamos para ela
+                if len(driver.window_handles) > 1:
+                    driver.switch_to.window(driver.window_handles[1])
+
+                # 5. VERIFICAÇÃO FINAL
                 url_final = driver.current_url
-                st.write(f"📍 URL final: {url_final}")
+                st.write(f"📍 Chegamos em: {url_final}")
                 
-                # Se cair no site institucional, tentamos uma última vez
-                if "www.amhp.com.br" in url_final:
-                    st.warning("⚠️ Redirecionado para o site institucional. Tentando re-acesso direto...")
-                    driver.get("https://amhptiss.amhp.com.br/Default.aspx")
-                    time.sleep(10)
-                    url_final = driver.current_url
-
-                driver.save_screenshot("resultado.png")
-                st.image("resultado.png", caption="Tela atual do navegador")
+                driver.save_screenshot("captura_tiss.png")
+                st.image("captura_tiss.png", caption="Tela atual do AMHPTISS")
 
                 if "amhptiss" in url_final.lower():
-                    st.success("✅ Logado com sucesso no AMHPTISS!")
+                    st.success("✅ SUCESSO! Você está dentro do AMHPTISS.")
                     st.balloons()
                 else:
-                    st.error("❌ Não foi possível manter a sessão ativa.")
+                    st.error("❌ O redirecionamento falhou. O sistema parou fora do TISS.")
 
-                status.update(label="Fim", state="complete", expanded=False)
+                status.update(label="Fluxo Finalizado", state="complete", expanded=False)
 
         except Exception as e:
             st.error(f"🚨 Erro: {e}")
-            driver.save_screenshot("erro.png")
-            st.image("erro.png")
+            driver.save_screenshot("erro_final.png")
+            st.image("erro_final.png")
         finally:
             driver.quit()
