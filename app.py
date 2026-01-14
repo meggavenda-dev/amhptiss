@@ -12,6 +12,26 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import TimeoutException
 
+def sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Limpeza defensiva para exibição/exportação:
+    - converte tudo para string
+    - remove caracteres problemáticos
+    """
+    if df is None or df.empty:
+        return df
+
+    df = df.copy()
+    for col in df.columns:
+        df[col] = (
+            df[col]
+            .astype(str)
+            .str.replace("\n", " ", regex=False)
+            .str.replace("\r", " ", regex=False)
+            .str.strip()
+        )
+    return df
+
 # ========= Secrets/env =========
 try:
     chrome_bin_secret = st.secrets.get("env", {}).get("CHROME_BINARY", None)
