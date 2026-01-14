@@ -136,84 +136,186 @@ def js_safe_click(driver, by, value, timeout=30, retries=3):
             if attempt == retries - 1:
                 raise
 
-# ========= Parser PDF (textual fallback) =========
-def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "text", debug: bool = False) -> pd.DataFrame:
+# ========= PDF → Tabela (coordenadas + textual reforçado) =========
+def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "coord", debug: bool = False) -> pd.DataFrame:
+    """
+    mode: "coord" (coordenadas) | "text" (fallback textual reforçado)
+    Sempre aplica ensure_atendimentos_schema() antes de retornar.
+    """
+    import pdfplumber
     from PyPDF2 import PdfReader
 
+    # Tolerâncias (apenas para 'coord')
+    TOP_TOL      = 4.5
+    MERGE_GAP_X  = 10.0
+    COL_MARGIN   = 4.0
+
+    # Regex comuns
     val_re        = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")
+    val_line_re   = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}$")
     code_start_re = re.compile(r"\d{3,6}-")
     re_total_blk  = re.compile(r"total\s*r\$\s*\d{1,3}(?:\.\d{3})*,\d{2}", re.I)
+    # Cabeça da linha (agora com SEARCH em vez de MATCH)
     head_re       = re.compile(r"(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+(.*)")
 
     def _normalize_ws(s: str) -> str:
         return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip()
 
-    def parse_by_text() -> pd.DataFrame:
-        reader = PdfReader(open(pdf_path, "rb"))
-        text_all = [page.extract_text() or "" for page in reader.pages]
-        big = _normalize_ws(" ".join(text_all))
-        if not big:
-            return pd.DataFrame(columns=TARGET_COLS)
+    # ---------- Coordenadas ----------
+    def parse_by_coords() -> pd.DataFrame:
+        all_records = []
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page_i, page in enumerate(pdf.pages, start=1):
+                    words = page.extract_words(
+                        use_text_flow=True,
+                        extra_attrs=["x0","x1","top","bottom"]
+                    )
+                    if not words:
+                        continue
 
-        big = re_total_blk.sub("", big)
-        parts = re.split(rf"({val_re.pattern})", big)
+                    # Cabeçalho
+                    header_y = None
+                    header_words = []
+                    for w in words:
+                        if "Atendimento" in w["text"]:
+                            y_top = w["top"]
+                            band = [ww for ww in words if abs(ww["top"] - y_top) < TOP_TOL]
+                            band_text = " ".join([b["text"] for b in band])
+                            if ("Valor" in band_text) and ("Total" in band_text):
+                                header_y = y_top
+                                header_words = sorted(band, key=lambda z: z["x0"])
+                                break
 
-        records = []
-        for i in range(1, len(parts), 2):
-            valor = parts[i].strip()
-            body  = _normalize_ws(parts[i-1])
-            m = head_re.search(body)
-            if m:
-                body = body[m.start():]
-            if body.lower().startswith("total"):
-                continue
-            records.append(f"{body} {valor}".strip())
+                    # Fallback extract_tables
+                    if header_y is None or not header_words:
+                        tbls = page.extract_tables()
+                        if tbls:
+                            df = pd.DataFrame(tbls[0])
+                            if not df.empty:
+                                df.columns = df.iloc[0]
+                                df = df.iloc[1:].dropna(how="all", axis=1)
+                                df = ensure_atendimentos_schema(df)
+                                for _, r in df.iterrows():
+                                    all_records.append({k: str(r.get(k, "")).strip() for k in TARGET_COLS})
+                        continue
 
-        parsed = []
-        for l in records:
-            m_vals = list(val_re.finditer(l))
-            if not m_vals:
-                continue
-            valor = m_vals[-1].group(0)
-            body  = l[:m_vals[-1].start()].strip()
+                    # Blocos do cabeçalho
+                    blocks, cur = [], [header_words[0]]
+                    for w in header_words[1:]:
+                        if (w["x0"] - cur[-1]["x1"]) <= MERGE_GAP_X:
+                            cur.append(w)
+                        else:
+                            blocks.append(cur); cur = [w]
+                    blocks.append(cur)
 
-            codes = list(code_start_re.finditer(body))
-            cred = prest = ""
-            if len(codes) >= 2:
-                i1, i2 = codes[-2].start(), codes[-1].start()
-                cred  = body[i1:i2].strip()
-                prest = body[i2:].strip()
-                body  = body[:i1].strip()
+                    header_blocks = [{
+                        "text": " ".join([b["text"] for b in bl]),
+                        "x0": min([b["x0"] for b in bl]),
+                        "x1": max([b["x1"] for b in bl]),
+                    } for bl in blocks]
 
-            m = head_re.search(body)
-            if not m:
-                continue
-            atendimento, nr_guia, realizacao, hora, rest = m.groups()
+                    def map_block(txt: str):
+                        t = txt.lower()
+                        if "atendimento" in t:                   return "Atendimento"
+                        if "nr" in t and "guia" in t:            return "NrGuia"
+                        if "realiza" in t:                       return "Realizacao"
+                        if "hora" in t:                          return "Hora"
+                        if "tipo" in t and "guia" in t:          return "TipoGuia"
+                        if "operadora" in t:                     return "Operadora"
+                        if "matr" in t:                          return "Matricula"
+                        if "benef" in t:                         return "Beneficiario"
+                        if "credenciado" in t:                   return "Credenciado"
+                        if "prestador" in t:                     return "Prestador"
+                        if "valor" in t and "total" in t:        return "ValorTotal"
+                        return None
 
-            toks = rest.split()
-            idx = next((i for i,t in enumerate(toks) if t.isdigit()), None)
-            tipo_guia = toks[0]
-            operadora = " ".join(toks[1:idx]) if idx else " ".join(toks[1:])
-            matricula = toks[idx] if idx else ""
-            beneficiario = " ".join(toks[idx+1:]) if idx else ""
+                    columns = []
+                    for hb in header_blocks:
+                        name = map_block(hb["text"])
+                        if name:
+                            columns.append({"name": name, "x0": hb["x0"], "x1": hb["x1"]})
+                    columns = sorted(columns, key=lambda c: c["x0"])
+                    if not columns:
+                        continue
 
-            parsed.append({
-                "Atendimento": atendimento,
-                "NrGuia": nr_guia,
-                "Realizacao": realizacao,
-                "Hora": hora,
-                "TipoGuia": tipo_guia,
-                "Operadora": operadora,
-                "Matricula": matricula,
-                "Beneficiario": beneficiario,
-                "Credenciado": cred,
-                "Prestador": prest,
-                "ValorTotal": valor,
-            })
+                    # Palavras de dados; corta "Total"
+                    data_words = [w for w in words if w["top"] > header_y + TOP_TOL]
+                    total_candidates = [w for w in data_words if w["text"].lower() == "total"]
+                    if total_candidates:
+                        total_y = total_candidates[0]["top"]
+                        data_words = [w for w in data_words if w["top"] < total_y - TOP_TOL]
 
-        return ensure_atendimentos_schema(pd.DataFrame(parsed))
+                    # Bandas (linhas)
+                    rows, band, last_top = [], [], None
+                    for w in sorted(data_words, key=lambda z: (round(z["top"], 1), z["x0"])):
+                        if (last_top is None) or (abs(w["top"] - last_top) <= TOP_TOL):
+                            band.append(w); last_top = w["top"]
+                        else:
+                            rows.append(band); band = [w]; last_top = w["top"]
+                    if band: rows.append(band)
 
-    return sanitize_df(parse_by_text())
+                    # Atribuição por centro mais próximo / interseção
+                    col_centers = [(c["name"], (c["x0"] + c["x1"]) / 2.0) for c in columns]
+                    def assign_to_nearest_col(w):
+                        wc = (w["x0"] + w["x1"]) / 2.0
+                        name, dist = None, 1e9
+                        for cname, cc in col_centers:
+                            d = abs(wc - cc)
+                            if d < dist: name, dist = cname, d
+                        return name
+
+                    for row_words in rows:
+                        bucket = {c["name"]: [] for c in columns}
+                        for w in row_words:
+                            cname = assign_to_nearest_col(w)
+                            if cname is None:
+                                for c in columns:
+                                    intersects = not (w["x1"] < (c["x0"] - COL_MARGIN) or w["x0"] > (c["x1"] + COL_MARGIN))
+                                    if intersects:
+                                        cname = c["name"]; break
+                            if cname is None:
+                                continue
+                            bucket[cname].append(w)
+
+                        cols_text = {k: " ".join([ww["text"] for ww in sorted(v, key=lambda z: z["x0"])]) for k, v in bucket.items()}
+                        if not cols_text.get("ValorTotal") or not val_line_re.search(cols_text["ValorTotal"]):
+                            continue
+
+                        # Ajuste Credenciado/Prestador
+                        tail = _normalize_ws(" ".join([cols_text.get("Beneficiario",""), cols_text.get("Credenciado",""), cols_text.get("Prestador","")]))
+                        starts = [m.start() for m in code_start_re.finditer(tail)]
+                        cred = cols_text.get("Credenciado","").strip()
+                        prest = cols_text.get("Prestador","").strip()
+                        if (not cred or not prest) and len(starts) >= 2:
+                            i1, i2 = starts[-2], starts[-1]
+                            prest = tail[i2:].strip()
+                            cred  = tail[i1:i2].strip()
+
+                        all_records.append({
+                            "Atendimento":   cols_text.get("Atendimento","").strip(),
+                            "NrGuia":        cols_text.get("NrGuia","").strip(),
+                            "Realizacao":    cols_text.get("Realizacao","").strip(),
+                            "Hora":          cols_text.get("Hora","").strip(),
+                            "TipoGuia":      cols_text.get("TipoGuia","").strip(),
+                            "Operadora":     cols_text.get("Operadora","").strip(),
+                            "Matricula":     cols_text.get("Matricula","").strip(),
+                            "Beneficiario":  cols_text.get("Beneficiario","").strip(),
+                            "Credenciado":   cred,
+                            "Prestador":     prest,
+                            "ValorTotal":    cols_text.get("ValorTotal","").strip(),
+                        })
+        except Exception as e:
+            if debug: st.error(f"[coord] Falha: {e}")
+
+        out = pd.DataFrame(all_records)
+        if not out.empty:
+            try:
+                out["Realizacao_dt"] = pd.to_datetime(out["Realizacao"], format="%d/%m/%Y", errors="coerce")
+                out = out.sort_values(["Realizacao_dt","Hora"]).drop(columns=["Realizacao_dt"])
+            except Exception:
+                pass
+        return ensure_atendimentos_schema(out)
 
 # ========= Sidebar =========
 with st.sidebar:
