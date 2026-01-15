@@ -151,11 +151,17 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, debug: bool = False) -> pd.DataF
         if txt:
             all_lines.extend(txt.splitlines())
 
-    # --- 1) TENTAR MODO TABELA ---
-    rows = []
+    # --- 1) Limpar cabeçalhos/rodapés ---
+    clean_lines = []
     for line in all_lines:
+        if "Atendimentos Realizados Sintético" in line: continue
+        if "Emitido por" in line and "Página" in line: continue
+        clean_lines.append(line.strip())
+
+    # --- 2) Tentar modo tabela (linhas com 11+ colunas separadas por espaços) ---
+    rows = []
+    for line in clean_lines:
         parts = re.split(r"\s{2,}", line.strip())
-        # Linha válida de atendimento: começa com número de 8 dígitos
         if len(parts) >= 11 and parts[0].isdigit() and len(parts[0]) == 8:
             rows.append(parts[:11])
 
@@ -163,12 +169,12 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, debug: bool = False) -> pd.DataF
         df = pd.DataFrame(rows, columns=TARGET_COLS)
         return sanitize_df(df)
 
-    # --- 2) SE NÃO FUNCIONAR, CAIR PARA MODO TEXTO CORRIDO ---
+    # --- 3) Se não funcionar, cair para modo texto corrido ---
     record_start_re = re.compile(r"(\d{8})\s+(\d{8})\s+(\d{2}/\d{2}/\d{4})")
     val_re = re.compile(r"(\d{1,3}(?:\.\d{3})*,\d{2})")
     code_re = re.compile(r"(\d{5,7}-)")
 
-    big = _normalize_ws("\n".join(all_lines))
+    big = _normalize_ws(" ".join(clean_lines))
     matches = list(record_start_re.finditer(big))
     parsed = []
 
@@ -222,7 +228,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, debug: bool = False) -> pd.DataF
         })
 
     df = pd.DataFrame(parsed)
-    return sanitize_df(df)
+    return ensure_atendimentos_schema(sanitize_df(df))
 
 # ========= Sidebar =========
 with st.sidebar:
