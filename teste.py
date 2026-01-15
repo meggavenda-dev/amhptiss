@@ -139,76 +139,114 @@ def js_safe_click(driver, by, value, timeout=30, retries=3):
 # ========= Parser PDF (textual fallback) =========
 def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "text", debug: bool = False) -> pd.DataFrame:
     from PyPDF2 import PdfReader
-
-    val_re        = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")
-    code_start_re = re.compile(r"\d{3,6}-")
-    re_total_blk  = re.compile(r"total\s*r\$\s*\d{1,3}(?:\.\d{3})*,\d{2}", re.I)
-    head_re       = re.compile(r"(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+(.*)")
+    import re
 
     def _normalize_ws(s: str) -> str:
         return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip()
 
+    # Regex para capturar o início do registro (Atendimento e Guia são iguais e têm 8 dígitos)
+    # Ex: 63974312 63974312 13/01/2026
+    record_start_re = re.compile(r"(\d{8})\s+(\d{8})\s+(\d{2}/\d{2}/\d{4})")
+    val_re = re.compile(r"(\d{1,3}(?:\.\d{3})*,\d{2})")
+
     def parse_by_text() -> pd.DataFrame:
         reader = PdfReader(open(pdf_path, "rb"))
-        text_all = [page.extract_text() or "" for page in reader.pages]
-        big = _normalize_ws(" ".join(text_all))
-        if not big:
-            return pd.DataFrame(columns=TARGET_COLS)
-
-        big = re_total_blk.sub("", big)
-        parts = re.split(rf"({val_re.pattern})", big)
-
-        records = []
-        for i in range(1, len(parts), 2):
-            valor = parts[i].strip()
-            body  = _normalize_ws(parts[i-1])
-            m = head_re.search(body)
-            if m:
-                body = body[m.start():]
-            if body.lower().startswith("total"):
-                continue
-            records.append(f"{body} {valor}".strip())
-
+        full_text = ""
+        for page in reader.pages:
+            full_text += page.extract_text() + " "
+        
+        big = _normalize_ws(full_text)
+        
+        # Identifica onde começa cada atendimento
+        matches = list(record_start_re.finditer(big))
         parsed = []
-        for l in records:
-            m_vals = list(val_re.finditer(l))
-            if not m_vals:
-                continue
-            valor = m_vals[-1].group(0)
-            body  = l[:m_vals[-1].start()].strip()
 
-            codes = list(code_start_re.finditer(body))
-            cred = prest = ""
+        for i in range(len(matches)):
+            start_idx = matches[i].start()
+            end_idx = matches[i+1].start() if i+1 < len(matches) else len(big)
+            chunk = big[start_idx:end_idx].strip()
+
+            # Extração básica do cabeçalho
+            atend, guia, data = matches[i].groups()
+            
+            # Tenta pegar a hora logo após a data
+            hora_match = re.search(r"(\d{2}:\d{2})", chunk)
+            hora = hora_match.group(1) if hora_match else ""
+
+            # Extração do Valor (último valor monetário do bloco)
+            valores = val_re.findall(chunk)
+            valor_total = valores[-1] if valores else "0,00"
+
+            # --- Lógica para o Miolo (Tipo Guia, Operadora, Beneficiário, Prestador, Credenciado) ---
+            # Removemos o que já pegamos para limpar a busca
+            miolo = chunk.replace(atend, "").replace(guia, "").replace(data, "").replace(valor_total, "").strip()
+            
+            # Identifica códigos de Prestador/Credenciado (padrão 000000-)
+            codes = list(re.finditer(r"(\d{5,7}-)", miolo))
+            
+            prestador = ""
+            credenciado = ""
+            
             if len(codes) >= 2:
-                i1, i2 = codes[-2].start(), codes[-1].start()
-                cred  = body[i1:i2].strip()
-                prest = body[i2:].strip()
-                body  = body[:i1].strip()
+                # O AMHP costuma colocar o Prestador antes do Credenciado ou vice-versa no texto extraído
+                # Mas quase sempre o penúltimo código é o Prestador e o último é o Credenciado (ou o contrário)
+                # Vamos capturar os blocos de texto que começam com esses códigos
+                p1_idx = codes[-2].start()
+                p2_idx = codes[-1].start()
+                
+                # Geralmente o Credenciado é a Clínica Diogenes Serquiz (014406)
+                # Vamos identificar pelo conteúdo
+                parte_a = miolo[p1_idx:p2_idx].strip()
+                parte_b = miolo[p2_idx:].strip()
+                
+                if "014406" in parte_a:
+                    credenciado = parte_a
+                    prestador = parte_b
+                else:
+                    prestador = parte_a
+                    credenciado = parte_b
+                
+                miolo_restante = miolo[:p1_idx].strip()
+            else:
+                miolo_restante = miolo
 
-            m = head_re.search(body)
-            if not m:
-                continue
-            atendimento, nr_guia, realizacao, hora, rest = m.groups()
-
-            toks = rest.split()
-            idx = next((i for i,t in enumerate(toks) if t.isdigit()), None)
-            tipo_guia = toks[0]
-            operadora = " ".join(toks[1:idx]) if idx else " ".join(toks[1:])
-            matricula = toks[idx] if idx else ""
-            beneficiario = " ".join(toks[idx+1:]) if idx else ""
+            # Tipo de Guia e Operadora (Consulta, SP/SADT, etc)
+            tipos_conhecidos = ["Consulta", "SP/SADT", "Não TISS", "SADT"]
+            tipo_guia = ""
+            for t in tipos_conhecidos:
+                if t in miolo_restante:
+                    tipo_guia = t
+                    break
+            
+            # O que sobrar no miolo_restante costuma ser "Operadora + Matrícula + Beneficiário"
+            # Ex: "BACEN(104) 8787234X030501 Alynne Marques Silva"
+            info_ben = miolo_restante.replace(tipo_guia, "").replace(hora, "").strip()
+            
+            # Regex para pegar a Operadora com código: ex BACEN(104)
+            ope_match = re.search(r"([A-Z\s\-\.]+\(\w+\))", info_ben)
+            operadora = ope_match.group(1) if ope_match else ""
+            
+            # O restante após a operadora
+            pos_ope = info_ben.find(operadora) + len(operadora) if operadora else 0
+            sobra = info_ben[pos_ope:].strip()
+            
+            # Se houver um número longo, é a matrícula
+            mat_match = re.search(r"(\d{5,})", sobra)
+            matricula = mat_match.group(1) if mat_match else ""
+            beneficiario = sobra.replace(matricula, "").strip()
 
             parsed.append({
-                "Atendimento": atendimento,
-                "NrGuia": nr_guia,
-                "Realizacao": realizacao,
+                "Atendimento": atend,
+                "NrGuia": guia,
+                "Realizacao": data,
                 "Hora": hora,
                 "TipoGuia": tipo_guia,
                 "Operadora": operadora,
                 "Matricula": matricula,
                 "Beneficiario": beneficiario,
-                "Credenciado": cred,
-                "Prestador": prest,
-                "ValorTotal": valor,
+                "Credenciado": credenciado,
+                "Prestador": prestador,
+                "ValorTotal": valor_total,
             })
 
         return ensure_atendimentos_schema(pd.DataFrame(parsed))
@@ -221,6 +259,7 @@ with st.sidebar:
     data_ini    = st.text_input("📅 Data Inicial (dd/mm/aaaa)", value="01/01/2026")
     data_fim    = st.text_input("📅 Data Final (dd/mm/aaaa)", value="13/01/2026")
     negociacao  = st.text_input("🤝 Tipo de Negociação", value="Direto")
+    credenciado_filter = st.text_input("🏥 Filtrar por Credenciado (opcional)", value="")
     status_list = st.multiselect(
         "📌 Status",
         options=["300 - Pronto para Processamento","200 - Em Análise","100 - Recebido","400 - Processado"],
@@ -294,12 +333,21 @@ if st.button("🚀 Iniciar Processo (PDF)"):
 
             # 5) Loop de Status
             for status_sel in status_list:
-                st.write(f"📝 Filtros → Negociação: **{negociacao}**, Status: **{status_sel}**, Período: **{data_ini}–{data_fim}**")
+                st.write(f"📝 Filtros → Negociação: **{negociacao}**, Status: **{status_sel}**, Credenciado: **{credenciado_filter or 'Todos'}**, Período: **{data_ini}–{data_fim}**")
 
                 neg_input  = wait.until(EC.presence_of_element_located((By.ID, "ctl00_MainContent_rcbTipoNegociacao_Input")))
                 stat_input = wait.until(EC.presence_of_element_located((By.ID, "ctl00_MainContent_rcbStatus_Input")))
                 driver.execute_script("arguments[0].value = arguments[1];", neg_input, negociacao); neg_input.send_keys(Keys.ENTER)
                 driver.execute_script("arguments[0].value = arguments[1];", stat_input, status_sel); stat_input.send_keys(Keys.ENTER)
+
+                # ⚡ Novo filtro Credenciado
+                if credenciado_filter.strip():
+                    cred_input = wait.until(
+                        EC.presence_of_element_located((By.ID, "ctl00_MainContent_rcbCredenciado_Input"))
+                    )
+                    driver.execute_script("arguments[0].value = arguments[1];", cred_input, credenciado_filter)
+                    cred_input.send_keys(Keys.ENTER)
+
                 d_ini_el = driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataInicio_dateInput"); d_ini_el.clear(); d_ini_el.send_keys(data_ini + Keys.TAB)
                 d_fim_el = driver.find_element(By.ID, "ctl00_MainContent_rdpDigitacaoDataFim_dateInput"); d_fim_el.clear(); d_fim_el.send_keys(data_fim + Keys.TAB)
 
@@ -346,6 +394,7 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                     if not df_pdf.empty:
                         df_pdf["Filtro_Negociacao"] = sanitize_value(negociacao)
                         df_pdf["Filtro_Status"]     = sanitize_value(status_sel)
+                        df_pdf["Filtro_Credenciado"] = sanitize_value(credenciado_filter)
                         df_pdf["Periodo_Inicio"]    = sanitize_value(data_ini)
                         df_pdf["Periodo_Fim"]       = sanitize_value(data_fim)
                         st.session_state.db_consolidado = pd.concat([st.session_state.db_consolidado, df_pdf], ignore_index=True)
