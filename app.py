@@ -265,6 +265,7 @@ with st.expander("🧪 Testar parser com upload de PDF (sem automação)", expan
             st.dataframe(df_test, use_container_width=True)
 
 # ========= Botão principal =========
+# ========= Botão principal =========
 if st.button("🚀 Iniciar Processo (PDF)"):
     driver = configurar_driver()
     try:
@@ -370,7 +371,8 @@ if st.button("🚀 Iniciar Processo (PDF)"):
                     shutil.move(recente, destino_pdf)
                     st.success(f"✅ PDF salvo: {destino_pdf}")
 
-                    df_pdf = parse_pdf_to_atendimentos_df(destino_pdf, mode="text", debug=debug_parser)
+                    # 👇 chamada corrigida, sem 'mode'
+                    df_pdf = parse_pdf_to_atendimentos_df(destino_pdf, debug=debug_parser)
                     if not df_pdf.empty:
                         df_pdf["Filtro_Negociacao"] = sanitize_value(negociacao)
                         df_pdf["Filtro_Status"]     = sanitize_value(status_sel)
@@ -408,7 +410,6 @@ if st.button("🚀 Iniciar Processo (PDF)"):
             driver.quit()
         except Exception:
             pass
-
 # ========= Resultados & Export =========
 if not st.session_state.db_consolidado.empty:
     st.divider()
