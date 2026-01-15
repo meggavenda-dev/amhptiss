@@ -139,76 +139,104 @@ def js_safe_click(driver, by, value, timeout=30, retries=3):
 # ========= Parser PDF (textual fallback) =========
 def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "text", debug: bool = False) -> pd.DataFrame:
     from PyPDF2 import PdfReader
-
-    val_re        = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}")
-    code_start_re = re.compile(r"\d{3,6}-")
-    re_total_blk  = re.compile(r"total\s*r\$\s*\d{1,3}(?:\.\d{3})*,\d{2}", re.I)
-    head_re       = re.compile(r"(\d+)\s+(\d+)\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s+(.*)")
+    import re
 
     def _normalize_ws(s: str) -> str:
         return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip()
 
+    # Regex para capturar o início da linha (Atendimento, Guia, Data, Hora)
+    # Ex: 63974312 63974312 13/01/2026 15:14
+    head_re = re.compile(r"(\d{8})\s+(\d{8})\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})")
+    
+    # Regex para capturar o padrão de valor monetário brasileiro (ex: 1.234,56 ou 148,60)
+    val_re = re.compile(r"(\d{1,3}(?:\.\d{3})*,\d{2})")
+
     def parse_by_text() -> pd.DataFrame:
         reader = PdfReader(open(pdf_path, "rb"))
-        text_all = [page.extract_text() or "" for page in reader.pages]
-        big = _normalize_ws(" ".join(text_all))
-        if not big:
-            return pd.DataFrame(columns=TARGET_COLS)
+        full_content = []
+        
+        for page in reader.pages:
+            text = page.extract_text()
+            if not text: continue
+            
+            # O PDF da AMHP separa as colunas por quebras de linha estranhas. 
+            # Vamos limpar excessos mas manter espaços.
+            lines = text.split('\n')
+            full_content.extend(lines)
 
-        big = re_total_blk.sub("", big)
-        parts = re.split(rf"({val_re.pattern})", big)
+        big_text = " ".join(full_content)
+        big_text = _normalize_ws(big_text)
 
-        records = []
-        for i in range(1, len(parts), 2):
-            valor = parts[i].strip()
-            body  = _normalize_ws(parts[i-1])
-            m = head_re.search(body)
-            if m:
-                body = body[m.start():]
-            if body.lower().startswith("total"):
-                continue
-            records.append(f"{body} {valor}".strip())
-
+        # 1. Identificar todos os "Heads" de atendimentos (Atendimento + Guia + Data + Hora)
+        starts = list(head_re.finditer(big_text))
         parsed = []
-        for l in records:
-            m_vals = list(val_re.finditer(l))
-            if not m_vals:
-                continue
-            valor = m_vals[-1].group(0)
-            body  = l[:m_vals[-1].start()].strip()
 
-            codes = list(code_start_re.finditer(body))
-            cred = prest = ""
+        for i in range(len(starts)):
+            # Define o bloco de texto entre este atendimento e o próximo
+            start_pos = starts[i].start()
+            end_pos = starts[i+1].start() if i+1 < len(starts) else len(big_text)
+            block = big_text[start_pos:end_pos]
+
+            # Extrair os dados do Cabeçalho
+            atendimento, guia, data, hora = starts[i].groups()
+            
+            # Remover o cabeçalho do bloco para sobrar o resto (Tipo Guia, Operadora, Beneficiário, etc)
+            rest_of_block = big_text[starts[i].end():end_pos].strip()
+
+            # O valor total está sempre no final do bloco (antes do próximo atendimento)
+            valor_matches = list(val_re.finditer(rest_of_block))
+            valor_total = valor_matches[-1].group(0) if valor_matches else "0,00"
+            
+            # Limpar o bloco para pegar o miolo
+            if valor_matches:
+                miolo = rest_of_block[:valor_matches[-1].start()].strip()
+            else:
+                miolo = rest_of_block
+
+            # Lógica de extração do "Miolo": [Tipo Guia] [Operadora] [Matricula] [Beneficiário] [Prestador] [Credenciado]
+            # No AMHP, o Tipo de Guia costuma ser a primeira palavra (Consulta, SP/SADT, etc)
+            words = miolo.split()
+            tipo_guia = words[0] if words else ""
+            
+            # Identificar Prestador e Credenciado (Geralmente começam com códigos tipo 014406-...)
+            codes = list(re.finditer(r"\d{5,6}-", miolo))
+            credenciado = ""
+            prestador = ""
+            
             if len(codes) >= 2:
-                i1, i2 = codes[-2].start(), codes[-1].start()
-                cred  = body[i1:i2].strip()
-                prest = body[i2:].strip()
-                body  = body[:i1].strip()
+                # O último código costuma ser o Prestador, o penúltimo o Credenciado
+                cred_idx = codes[-2].start()
+                prest_idx = codes[-1].start()
+                credenciado = miolo[cred_idx:prest_idx].strip()
+                prestador = miolo[prest_idx:].strip()
+                # O que sobrar entre o Tipo de Guia e o Credenciado é Operadora + Beneficiário
+                meio = miolo[len(tipo_guia):cred_idx].strip()
+            else:
+                meio = miolo[len(tipo_guia):].strip()
 
-            m = head_re.search(body)
-            if not m:
-                continue
-            atendimento, nr_guia, realizacao, hora, rest = m.groups()
-
-            toks = rest.split()
-            idx = next((i for i,t in enumerate(toks) if t.isdigit()), None)
-            tipo_guia = toks[0]
-            operadora = " ".join(toks[1:idx]) if idx else " ".join(toks[1:])
-            matricula = toks[idx] if idx else ""
-            beneficiario = " ".join(toks[idx+1:]) if idx else ""
+            # Separar Operadora de Beneficiário (A operadora costuma ter o código entre parênteses)
+            operadora_match = re.search(r"(.*?\(\d+\))", meio)
+            if operadora_match:
+                operadora = operadora_match.group(1).strip()
+                beneficiario = meio[operadora_match.end():].strip()
+            else:
+                # Fallback caso não ache parênteses: pega as 2 primeiras palavras como operadora
+                parts_meio = meio.split()
+                operadora = " ".join(parts_meio[:2]) if len(parts_meio) > 2 else ""
+                beneficiario = " ".join(parts_meio[2:]) if len(parts_meio) > 2 else ""
 
             parsed.append({
                 "Atendimento": atendimento,
-                "NrGuia": nr_guia,
-                "Realizacao": realizacao,
+                "NrGuia": guia,
+                "Realizacao": data,
                 "Hora": hora,
                 "TipoGuia": tipo_guia,
                 "Operadora": operadora,
-                "Matricula": matricula,
+                "Matricula": "", # A matrícula muitas vezes se funde com o nome, deixamos vazio ou extraímos via regex se houver padrão fixo
                 "Beneficiario": beneficiario,
-                "Credenciado": cred,
-                "Prestador": prest,
-                "ValorTotal": valor,
+                "Credenciado": credenciado,
+                "Prestador": prestador,
+                "ValorTotal": valor_total,
             })
 
         return ensure_atendimentos_schema(pd.DataFrame(parsed))
