@@ -193,7 +193,7 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, debug: bool = False) -> pd.DataF
     valor_re = re.compile(r"\b(\d{1,3}(?:\.\d{3})*,\d{2})\b")
     tipo_tokens = ["Consulta", "SP/SADT", "Não TISS", "SADT"]
     cod_re = re.compile(r"\b(\d{5,6}-[A-Z0-9].+?)\b")  # código + nome
-    operadora_re = re.compile(r"\b([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-ZÁÉÍÓÚÂÊÔÃÕÇ\s\-/]+?)\s*\(\s*\d{2,4}\s*\)")
+    operadora_re = re.compile(r"\b([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-ZÁÉÍÓÚÂÊÔÃÕÇ\s\-/]+?)(?:\(\s*\d{2,4}\s*\))?")
 
     for i in range(len(matches)):
         start_idx = matches[i].start()
