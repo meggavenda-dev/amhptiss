@@ -173,127 +173,44 @@ def fix_row(row):
     return row
 
 # ========= Parser PDF (textual fallback) =========
+# ========= Parser PDF confiável com pdfplumber =========
 def parse_pdf_to_atendimentos_df(pdf_path: str, debug: bool = False) -> pd.DataFrame:
-    from PyPDF2 import PdfReader
-    import re
+    import pdfplumber
 
-    def _normalize_ws(s: str) -> str:
-        return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip()
+    all_rows = []
 
-    reader = PdfReader(open(pdf_path, "rb"))
-    all_lines = []
-    for page in reader.pages:
-        txt = page.extract_text()
-        if txt:
-            all_lines.extend(txt.splitlines())
+    # abre PDF
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            table = page.extract_table()
+            if table:
+                # pular cabeçalho da tabela
+                for row in table[1:]:
+                    all_rows.append(row)
 
-    # remove cabeçalhos/rodapés comuns
-    clean_lines = []
-    for line in all_lines:
-        if "Atendimentos Realizados Sintético" in line: continue
-        if "Emitido por" in line and "Página" in line: continue
-        clean_lines.append(line.strip())
+    if not all_rows:
+        return pd.DataFrame(columns=TARGET_COLS)
 
-    big = _normalize_ws(" ".join(clean_lines))
+    # cria DataFrame inicial
+    df_raw = pd.DataFrame(all_rows)
 
-    # início de registro: atendimento(8) guia(8) data
-    record_start_re = re.compile(r"(?P<atend>\d{8})\s+(?P<guia>\d{8})\s+(?P<data>\d{2}/\d{2}/\d{4})")
-    matches = list(record_start_re.finditer(big))
-    parsed = []
+    # renomeia colunas baseado no TARGET_COLS (heurística)
+    n_cols = df_raw.shape[1]
+    cols = TARGET_COLS[:n_cols]  # pega apenas o necessário
+    df_raw.columns = cols
 
-    # padrões auxiliares
-    hora_re = re.compile(r"\b(\d{2}:\d{2})\b")
-    valor_re = re.compile(r"\b(\d{1,3}(?:\.\d{3})*,\d{2})\b")
-    tipo_tokens = ["Consulta", "SP/SADT", "Não TISS", "SADT"]
-    cod_re = re.compile(r"\b(\d{5,6}-[A-Z0-9].+?)\b")  # código + nome
-    operadora_re = re.compile(r"\b([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-ZÁÉÍÓÚÂÊÔÃÕÇ\s\-/]+?)(?:\(\s*\d{2,4}\s*\))?")
+    # sanitiza todos os valores
+    df = sanitize_df(df_raw)
 
-    for i in range(len(matches)):
-        start_idx = matches[i].start()
-        end_idx = matches[i+1].start() if i+1 < len(matches) else len(big)
-        chunk = big[start_idx:end_idx].strip()
-
-        atend = matches[i].group("atend")
-        guia  = matches[i].group("guia")
-        data  = matches[i].group("data")
-
-        # hora
-        hora_m = hora_re.search(chunk)
-        hora = hora_m.group(1) if hora_m else ""
-
-        # valor total: último valor do bloco
-        valores = valor_re.findall(chunk)
-        valor_total = valores[-1] if valores else ""
-
-        # tipo de guia
-        tipo_guia = ""
-        for t in tipo_tokens:
-            if t in chunk:
-                tipo_guia = t
-                break
-
-        # operadora
-        operadora_m = operadora_re.search(chunk)
-        operadora = operadora_m.group(0) if operadora_m else ""
-
-        # remover campos já identificados para isolar o "miolo"
-        miolo = chunk
-        for token in [atend, guia, data, hora, valor_total, tipo_guia, operadora]:
-            if token:
-                miolo = miolo.replace(token, " ")
-        miolo = _normalize_ws(miolo)
-
-        # códigos (credenciado/prestador)
-        codes = list(cod_re.finditer(miolo))
-        credenciado, prestador = "", ""
-        if len(codes) >= 2:
-            # heurística: último é prestador, penúltimo é credenciado
-            credenciado = codes[-2].group(1).strip()
-            prestador   = codes[-1].group(1).strip()
-            # remove ambos do miolo
-            miolo = miolo.replace(credenciado, " ").replace(prestador, " ")
-            miolo = _normalize_ws(miolo)
-        elif len(codes) == 1:
-            # se só um, assume como credenciado
-            credenciado = codes[0].group(1).strip()
-            miolo = _normalize_ws(miolo.replace(credenciado, " "))
-
-        # matrícula: bloco alfanumérico médio (evitar capturar códigos)
-        mat_m = re.search(r"\b([A-Z0-9]{5,}X?[A-Z0-9/]*)\b", miolo)
-        matricula = mat_m.group(1) if mat_m else ""
-
-        # beneficiário: o restante após matrícula
-        beneficiario = miolo
-        if matricula:
-            beneficiario = _normalize_ws(beneficiario.replace(matricula, ""))
-        # limpa resíduos óbvios
-        beneficiario = re.sub(r"\b(Consulta|SP/SADT|Não TISS|SADT)\b", "", beneficiario).strip()
-
-        parsed.append({
-            "Atendimento": atend,
-            "NrGuia": guia,
-            "Realizacao": data,
-            "Hora": hora,
-            "TipoGuia": tipo_guia,
-            "Operadora": operadora,
-            "Matricula": matricula,
-            "Beneficiario": beneficiario,
-            "Credenciado": credenciado,
-            "Prestador": prestador,
-            "ValorTotal": valor_total
-        })
-
-    df = pd.DataFrame(parsed)
-    df = ensure_atendimentos_schema(sanitize_df(df))
-
-    # pós-processamento: correções rápidas
+    # aplica correções rápidas
     df = df.apply(fix_row, axis=1)
 
     if debug:
-        import io
-        buf = io.StringIO()
-        df.head(20).to_string(buf)
-        print(buf.getvalue())
+        st.write("🔍 Debug PDF (primeiras linhas extraídas)")
+        st.dataframe(df.head(10))
+
+    # garante esquema completo
+    df = ensure_atendimentos_schema(df)
 
     return df
 
