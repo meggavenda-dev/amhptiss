@@ -89,6 +89,29 @@ def ensure_atendimentos_schema(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = ""
     return df[TARGET_COLS]
 
+def validate_df(df: pd.DataFrame):
+    issues = []
+    for i, r in df.iterrows():
+        # Atendimento/NrGuia devem ser 8 dígitos
+        if not re.fullmatch(r"\d{8}", str(r["Atendimento"])):
+            issues.append((i, "Atendimento inválido"))
+        if not re.fullmatch(r"\d{8}", str(r["NrGuia"])):
+            issues.append((i, "NrGuia inválido"))
+
+        # Data dd/mm/aaaa
+        if not re.fullmatch(r"\d{2}/\d{2}/\d{4}", str(r["Realizacao"])):
+            issues.append((i, "Data inválida"))
+
+        # Operadora com sufixo numérico
+        if isinstance(r["Operadora"], str) and not re.search(r"\(.+\)$", r["Operadora"]):
+            issues.append((i, "Operadora sem código"))
+
+        # ValorTotal no formato brasileiro
+        if isinstance(r["ValorTotal"], str) and not re.fullmatch(r"\d{1,3}(\.\d{3})*,\d{2}", r["ValorTotal"]):
+            issues.append((i, "ValorTotal inválido"))
+
+    return issues
+
 # ========= Selenium =========
 def configurar_driver():
     opts = Options()
@@ -142,141 +165,101 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, debug: bool = False) -> pd.DataF
     import re
 
     def _normalize_ws(s: str) -> str:
-        s = s.replace("\u00A0", " ")
-        s = re.sub(r"[ \t]+", " ", s)
-        return s.strip()
+        return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip()
 
-    # Read all text
     reader = PdfReader(open(pdf_path, "rb"))
-    lines = []
+    all_lines = []
     for page in reader.pages:
-        txt = page.extract_text() or ""
-        lines.extend(txt.splitlines())
+        txt = page.extract_text()
+        if txt:
+            all_lines.extend(txt.splitlines())
 
-    # Remove headers/footers/artifacts
-    junk_markers = [
-        "Atendimentos Realizados Sintético",
-        "Emitido por", "Página", "amhp", "SOLUÇÕES INTEGRADAS",
-        "Associação dos Médicos de Hospitais Privados- DF",
-        "Atendimento Nr. Guia Prontuário Realização Hora Tipo de Guia Operadora Matrícula Beneficiário Credenciado Prestador Valor Total",
-    ]
-    clean = []
-    for ln in lines:
-        ln2 = ln.strip()
-        if any(m in ln2 for m in junk_markers):
-            continue
-        if not ln2:
-            continue
-        clean.append(ln2)
+    # remove cabeçalhos/rodapés comuns
+    clean_lines = []
+    for line in all_lines:
+        if "Atendimentos Realizados Sintético" in line: continue
+        if "Emitido por" in line and "Página" in line: continue
+        clean_lines.append(line.strip())
 
-    big = _normalize_ws(" ".join(clean))
+    big = _normalize_ws(" ".join(clean_lines))
 
-    # Row anchors
-    row_re = re.compile(r"(\d{8})\s+(\d{8})\s+(\d{2}/\d{2}/\d{4})")
-    rows = list(row_re.finditer(big))
-
-    if debug:
-        print(f"[DEBUG] Found {len(rows)} row anchors")
-
+    # início de registro: atendimento(8) guia(8) data
+    record_start_re = re.compile(r"(?P<atend>\d{8})\s+(?P<guia>\d{8})\s+(?P<data>\d{2}/\d{2}/\d{4})")
+    matches = list(record_start_re.finditer(big))
     parsed = []
-    # Helper regexes
-    hora_re       = re.compile(r"\b(\d{2}:\d{2})\b")
-    tipo_choices  = ["Consulta", "SP/SADT", "Não TISS", "SADT"]
-    operadora_re  = re.compile(r"([A-ZÁÉÍÓÚÂÊÔÃÕÇ0-9\s\-/]+\( *\d+ *\))")
-    matricula_re  = re.compile(r"\b([A-Z0-9/.\-]{5,})\b")
-    prov_block_re = re.compile(r"(\d{5,6}-[^\d]+?(?=(?:\s\d{5,6}-)|$))")
-    money_re      = re.compile(r"(\d{1,3}(?:\.\d{3})*,\d{2})")
 
-    for i, m in enumerate(rows):
-        start = m.start()
-        end   = rows[i+1].start() if i+1 < len(rows) else len(big)
-        chunk = big[start:end].strip()
+    # padrões auxiliares
+    hora_re = re.compile(r"\b(\d{2}:\d{2})\b")
+    valor_re = re.compile(r"\b(\d{1,3}(?:\.\d{3})*,\d{2})\b")
+    tipo_tokens = ["Consulta", "SP/SADT", "Não TISS", "SADT"]
+    cod_re = re.compile(r"\b(\d{5,6}-[A-Z0-9].+?)\b")  # código + nome
+    operadora_re = re.compile(r"\b([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-ZÁÉÍÓÚÂÊÔÃÕÇ\s\-/]+?)\s*\(\s*\d{2,4}\s*\)")
 
-        atendimento, nrguia, realizacao = m.groups()
+    for i in range(len(matches)):
+        start_idx = matches[i].start()
+        end_idx = matches[i+1].start() if i+1 < len(matches) else len(big)
+        chunk = big[start_idx:end_idx].strip()
 
-        # Hora
+        atend = matches[i].group("atend")
+        guia  = matches[i].group("guia")
+        data  = matches[i].group("data")
+
+        # hora
         hora_m = hora_re.search(chunk)
         hora = hora_m.group(1) if hora_m else ""
 
-        # TipoGuia
+        # valor total: último valor do bloco
+        valores = valor_re.findall(chunk)
+        valor_total = valores[-1] if valores else ""
+
+        # tipo de guia
         tipo_guia = ""
-        for t in tipo_choices:
-            idx = chunk.find(t)
-            if idx != -1:
-                if not tipo_guia or idx < chunk.find(tipo_guia):
-                    tipo_guia = t
+        for t in tipo_tokens:
+            if t in chunk:
+                tipo_guia = t
+                break
 
-        # Operadora (nearest after TipoGuia)
-        operadora = ""
-        if tipo_guia:
-            after_tipo = chunk[chunk.find(tipo_guia) + len(tipo_guia):]
-            op_m = operadora_re.search(after_tipo)
-            operadora = op_m.group(1).strip() if op_m else ""
-        else:
-            op_m = operadora_re.search(chunk)
-            operadora = op_m.group(1).strip() if op_m else ""
+        # operadora
+        operadora_m = operadora_re.search(chunk)
+        operadora = operadora_m.group(0) if operadora_m else ""
 
-        # Matrícula (next token after operadora)
-        matricula = ""
-        if operadora:
-            after_op = chunk[chunk.find(operadora) + len(operadora):]
-            mat_m = matricula_re.search(after_op)
-            matricula = mat_m.group(1) if mat_m else ""
-        else:
-            mat_m = matricula_re.search(chunk)
-            matricula = mat_m.group(1) if mat_m else ""
+        # remover campos já identificados para isolar o "miolo"
+        miolo = chunk
+        for token in [atend, guia, data, hora, valor_total, tipo_guia, operadora]:
+            if token:
+                miolo = miolo.replace(token, " ")
+        miolo = _normalize_ws(miolo)
 
-        # Beneficiário: text between matrícula and first provider block
-        beneficiario = ""
-        credenciado  = ""
-        prestador    = ""
+        # códigos (credenciado/prestador)
+        codes = list(cod_re.finditer(miolo))
+        credenciado, prestador = "", ""
+        if len(codes) >= 2:
+            # heurística: último é prestador, penúltimo é credenciado
+            credenciado = codes[-2].group(1).strip()
+            prestador   = codes[-1].group(1).strip()
+            # remove ambos do miolo
+            miolo = miolo.replace(credenciado, " ").replace(prestador, " ")
+            miolo = _normalize_ws(miolo)
+        elif len(codes) == 1:
+            # se só um, assume como credenciado
+            credenciado = codes[0].group(1).strip()
+            miolo = _normalize_ws(miolo.replace(credenciado, " "))
 
-        # Find provider blocks
-        prov_blocks = list(prov_block_re.finditer(chunk))
-        # Compute beneficiary span
+        # matrícula: bloco alfanumérico médio (evitar capturar códigos)
+        mat_m = re.search(r"\b([A-Z0-9]{5,}X?[A-Z0-9/]*)\b", miolo)
+        matricula = mat_m.group(1) if mat_m else ""
+
+        # beneficiário: o restante após matrícula
+        beneficiario = miolo
         if matricula:
-            mat_pos = chunk.find(matricula)
-            ben_start = mat_pos + len(matricula)
-        else:
-            # fallback: after operadora or tipo
-            if operadora:
-                ben_start = chunk.find(operadora) + len(operadora)
-            elif tipo_guia:
-                ben_start = chunk.find(tipo_guia) + len(tipo_guia)
-            else:
-                ben_start = 0
-
-        if prov_blocks:
-            ben_end = prov_blocks[0].start()
-            beneficiario = _normalize_ws(chunk[ben_start:ben_end])
-            # Map provider blocks
-            if len(prov_blocks) >= 2:
-                credenciado = _normalize_ws(prov_blocks[0].group(0))
-                prestador   = _normalize_ws(prov_blocks[1].group(0))
-            else:
-                prestador   = _normalize_ws(prov_blocks[0].group(0))
-        else:
-            # No provider blocks found—take until last money or end
-            tail_money = list(money_re.finditer(chunk))
-            ben_end = tail_money[-1].start() if tail_money else len(chunk)
-            beneficiario = _normalize_ws(chunk[ben_start:ben_end])
-
-        # ValorTotal: last money near the end
-        valor_total = "0,00"
-        tail = chunk[-80:]  # look at the tail to avoid earlier amounts
-        tail_money = money_re.findall(tail)
-        if tail_money:
-            valor_total = tail_money[-1]
-        else:
-            # fallback: last money anywhere
-            all_money = money_re.findall(chunk)
-            if all_money:
-                valor_total = all_money[-1]
+            beneficiario = _normalize_ws(beneficiario.replace(matricula, ""))
+        # limpa resíduos óbvios
+        beneficiario = re.sub(r"\b(Consulta|SP/SADT|Não TISS|SADT)\b", "", beneficiario).strip()
 
         parsed.append({
-            "Atendimento": atendimento,
-            "NrGuia": nrguia,
-            "Realizacao": realizacao,
+            "Atendimento": atend,
+            "NrGuia": guia,
+            "Realizacao": data,
             "Hora": hora,
             "TipoGuia": tipo_guia,
             "Operadora": operadora,
@@ -284,13 +267,23 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, debug: bool = False) -> pd.DataF
             "Beneficiario": beneficiario,
             "Credenciado": credenciado,
             "Prestador": prestador,
-            "ValorTotal": valor_total,
+            "ValorTotal": valor_total
         })
 
     df = pd.DataFrame(parsed)
-    df = sanitize_df(df)
-    df = ensure_atendimentos_schema(df)
+    df = ensure_atendimentos_schema(sanitize_df(df))
+
+    # pós-processamento: correções rápidas
+    df = df.apply(fix_row, axis=1)
+
+    if debug:
+        import io
+        buf = io.StringIO()
+        df.head(20).to_string(buf)
+        print(buf.getvalue())
+
     return df
+
 
 # ========= Sidebar =========
 with st.sidebar:
@@ -316,14 +309,17 @@ with st.expander("🧪 Testar parser com upload de PDF (sem automação)", expan
         tmp_pdf = os.path.join(DOWNLOAD_TEMPORARIO, "teste_upload.pdf")
         with open(tmp_pdf, "wb") as f:
             f.write(up.getvalue())
-        df_test = parse_pdf_to_atendimentos_df(tmp_pdf, mode="text", debug=debug_parser)
+
+        df_test = parse_pdf_to_atendimentos_df(tmp_pdf, debug=debug_parser)
+
         if df_test.empty:
             st.error("Parser não conseguiu extrair linhas deste PDF usando o modo textual.")
         else:
-            st.success(f"{len(df_test)} linha(s) extraída(s) pelo modo textual.")
+            issues = validate_df(df_test)
+            if issues:
+                st.warning(f"Inconsistências detectadas em {len(issues)} linha(s). Ex.: {issues[:5]}")
             st.dataframe(df_test, use_container_width=True)
 
-# ========= Botão principal =========
 # ========= Botão principal =========
 if st.button("🚀 Iniciar Processo (PDF)"):
     driver = configurar_driver()
@@ -432,6 +428,10 @@ if st.button("🚀 Iniciar Processo (PDF)"):
 
                     # 👇 chamada corrigida, sem 'mode'
                     df_pdf = parse_pdf_to_atendimentos_df(destino_pdf, debug=debug_parser)
+                    issues = validate_df(df_pdf)
+                    if issues:
+                        st.warning(f"Inconsistências detectadas em {len(issues)} linha(s). Ex.: {issues[:5]}")
+                        
                     if not df_pdf.empty:
                         df_pdf["Filtro_Negociacao"] = sanitize_value(negociacao)
                         df_pdf["Filtro_Status"]     = sanitize_value(status_sel)
@@ -476,7 +476,18 @@ if not st.session_state.db_consolidado.empty:
     st.subheader("📊 Base consolidada (temporária)")
     st.dataframe(df_preview, use_container_width=True)
 
+    # 🔎 Validação final
+    final_issues = validate_df(df_preview)
+    if final_issues:
+        st.warning(f"Inconsistências remanescentes: {len(final_issues)}. Ex.: {final_issues[:10]}")
+    else:
+        st.success("Base consolidada sem inconsistências de formato.")
+
+    # Exportação CSV
     csv_bytes = df_preview.to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button("💾 Baixar Consolidação (CSV)", csv_bytes,    file_name="consolidado_amhp.csv",
+    st.download_button(
+        "💾 Baixar Consolidação (CSV)",
+        csv_bytes,
+        file_name="consolidado_amhp.csv",
         mime="text/csv"
     )
