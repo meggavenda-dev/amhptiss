@@ -144,94 +144,85 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, debug: bool = False) -> pd.DataF
     def _normalize_ws(s: str) -> str:
         return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip()
 
-    # Regex para identificar início de linha: Atendimento (8 dig) + Guia (8 dig) + Data (dd/mm/aaaa)
+    reader = PdfReader(open(pdf_path, "rb"))
+    all_lines = []
+    for page in reader.pages:
+        txt = page.extract_text()
+        if txt:
+            all_lines.extend(txt.splitlines())
+
+    # --- 1) TENTAR MODO TABELA ---
+    rows = []
+    for line in all_lines:
+        parts = re.split(r"\s{2,}", line.strip())
+        # Linha válida de atendimento: começa com número de 8 dígitos
+        if len(parts) >= 11 and parts[0].isdigit() and len(parts[0]) == 8:
+            rows.append(parts[:11])
+
+    if rows:
+        df = pd.DataFrame(rows, columns=TARGET_COLS)
+        return sanitize_df(df)
+
+    # --- 2) SE NÃO FUNCIONAR, CAIR PARA MODO TEXTO CORRIDO ---
     record_start_re = re.compile(r"(\d{8})\s+(\d{8})\s+(\d{2}/\d{2}/\d{4})")
-    # Regex para valores monetários
     val_re = re.compile(r"(\d{1,3}(?:\.\d{3})*,\d{2})")
-    # Regex para códigos de prestador/credenciado
     code_re = re.compile(r"(\d{5,7}-)")
 
-    try:
-        reader = PdfReader(open(pdf_path, "rb"))
-        full_text = ""
-        for page in reader.pages:
-            txt = page.extract_text()
-            if txt: full_text += txt + "\n"
-        
-        big = _normalize_ws(full_text)
-        matches = list(record_start_re.finditer(big))
-        parsed = []
+    big = _normalize_ws("\n".join(all_lines))
+    matches = list(record_start_re.finditer(big))
+    parsed = []
 
-        for i in range(len(matches)):
-            start_idx = matches[i].start()
-            end_idx = matches[i+1].start() if i+1 < len(matches) else len(big)
-            chunk = big[start_idx:end_idx].strip()
+    for i in range(len(matches)):
+        start_idx = matches[i].start()
+        end_idx = matches[i+1].start() if i+1 < len(matches) else len(big)
+        chunk = big[start_idx:end_idx].strip()
 
-            atend, guia, data = matches[i].groups()
-            
-            # Hora
-            hora_m = re.search(r"(\d{2}:\d{2})", chunk)
-            hora = hora_m.group(1) if hora_m else ""
+        atend, guia, data = matches[i].groups()
+        hora_m = re.search(r"(\d{2}:\d{2})", chunk)
+        hora = hora_m.group(1) if hora_m else ""
 
-            # Valor Total (O valor total real costuma ser o último valor monetário do bloco)
-            valores = val_re.findall(chunk)
-            valor_total = valores[-1] if valores else "0,00"
+        valores = val_re.findall(chunk)
+        valor_total = valores[-1] if valores else "0,00"
 
-            # Limpando o "miolo" para extrair os nomes
-            miolo = chunk.replace(atend, "").replace(guia, "").replace(data, "").replace(valor_total, "").strip()
-            
-            # Localizando Prestador e Credenciado (baseado nos códigos 000000-)
-            codes = list(code_re.finditer(miolo))
-            prestador, credenciado = "", ""
-            miolo_restante = miolo
+        miolo = chunk.replace(atend, "").replace(guia, "").replace(data, "").replace(valor_total, "").strip()
+        codes = list(code_re.finditer(miolo))
+        prestador, credenciado = "", ""
+        miolo_restante = miolo
 
-            if len(codes) >= 2:
-                # Geralmente o penúltimo código é o Prestador e o último é o Credenciado
-                p1, p2 = codes[-2].start(), codes[-1].start()
-                parte_a = miolo[p1:p2].strip()
-                parte_b = miolo[p2:].strip()
-                
-                # Identificação por código fixo (AMHP - Clínica Diogenes costuma ser o credenciado 014406)
-                if "014406" in parte_a:
-                    credenciado, prestador = parte_a, parte_b
-                else:
-                    prestador, credenciado = parte_a, parte_b
-                miolo_restante = miolo[:p1].strip()
-            elif len(codes) == 1:
-                prestador = miolo[codes[0].start():].strip()
-                miolo_restante = miolo[:codes[0].start()].strip()
+        if len(codes) >= 2:
+            p1, p2 = codes[-2].start(), codes[-1].start()
+            parte_a = miolo[p1:p2].strip()
+            parte_b = miolo[p2:].strip()
+            if "014406" in parte_a:
+                credenciado, prestador = parte_a, parte_b
+            else:
+                prestador, credenciado = parte_a, parte_b
+            miolo_restante = miolo[:p1].strip()
+        elif len(codes) == 1:
+            prestador = miolo[codes[0].start():].strip()
+            miolo_restante = miolo[:codes[0].start()].strip()
 
-            # Tipo de Guia
-            tipos = ["Consulta", "SP/SADT", "Não TISS", "SADT"]
-            tipo_guia = ""
-            for t in tipos:
-                if t in miolo_restante:
-                    tipo_guia = t
-                    break
-            
-            # Operadora, Matrícula e Beneficiário
-            info = miolo_restante.replace(tipo_guia, "").replace(hora, "").strip()
-            # Padrão: Operadora(cod) Matrícula Nome
-            ope_match = re.search(r"([A-Z\s\-\.]+\(\w+\))", info)
-            operadora = ope_match.group(1) if ope_match else ""
-            
-            sobra = info.replace(operadora, "").strip()
-            mat_match = re.search(r"(\d{5,})", sobra)
-            matricula = mat_match.group(1) if mat_match else ""
-            beneficiario = sobra.replace(matricula, "").strip()
+        tipos = ["Consulta", "SP/SADT", "Não TISS", "SADT"]
+        tipo_guia = next((t for t in tipos if t in miolo_restante), "")
 
-            parsed.append({
-                "Atendimento": atend, "NrGuia": guia, "Realizacao": data, "Hora": hora,
-                "TipoGuia": tipo_guia, "Operadora": operadora, "Matricula": matricula,
-                "Beneficiario": beneficiario, "Credenciado": credenciado,
-                "Prestador": prestador, "ValorTotal": valor_total
-            })
-        
-        df = pd.DataFrame(parsed)
-        return sanitize_df(df)
-    except Exception as e:
-        if debug: st.error(f"Erro no parser: {e}")
-        return pd.DataFrame()
+        info = miolo_restante.replace(tipo_guia, "").replace(hora, "").strip()
+        ope_match = re.search(r"([A-ZÁÉÍÓÚÂÊÔÃÕÇ\s\-/]+\( *\d+ *\))", info)
+        operadora = ope_match.group(1) if ope_match else ""
+
+        sobra = info.replace(operadora, "").strip()
+        mat_match = re.search(r"([A-Z0-9]{5,})", sobra)
+        matricula = mat_match.group(1) if mat_match else ""
+        beneficiario = sobra.replace(matricula, "").strip()
+
+        parsed.append({
+            "Atendimento": atend, "NrGuia": guia, "Realizacao": data, "Hora": hora,
+            "TipoGuia": tipo_guia, "Operadora": operadora, "Matricula": matricula,
+            "Beneficiario": beneficiario, "Credenciado": credenciado,
+            "Prestador": prestador, "ValorTotal": valor_total
+        })
+
+    df = pd.DataFrame(parsed)
+    return sanitize_df(df)
 
 # ========= Sidebar =========
 with st.sidebar:
