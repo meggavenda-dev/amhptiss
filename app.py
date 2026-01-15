@@ -159,6 +159,19 @@ def js_safe_click(driver, by, value, timeout=30, retries=3):
             if attempt == retries - 1:
                 raise
 
+def fix_row(row):
+    # Corrige Beneficiário contaminado com cabeçalho/rodapé
+    if isinstance(row["Beneficiario"], str) and re.search(r"\d{2}/\d{2}/\d{4}", row["Beneficiario"]):
+        row["Beneficiario"] = row["Beneficiario"].split()[0]  # simplificação
+
+    # Corrige inversão Credenciado/Prestador
+    has_code_cred = isinstance(row["Credenciado"], str) and re.search(r"\d{5,6}-", row["Credenciado"])
+    has_code_prest = isinstance(row["Prestador"], str) and re.search(r"\d{5,6}-", row["Prestador"])
+    if has_code_prest and not has_code_cred:
+        row["Credenciado"], row["Prestador"] = row["Prestador"], row["Credenciado"]
+
+    return row
+
 # ========= Parser PDF (textual fallback) =========
 def parse_pdf_to_atendimentos_df(pdf_path: str, debug: bool = False) -> pd.DataFrame:
     from PyPDF2 import PdfReader
