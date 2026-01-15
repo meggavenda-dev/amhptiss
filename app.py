@@ -144,68 +144,6 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "text", debug: bool 
     def _normalize_ws(s: str) -> str:
         return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip()
 
-    # Regex para capturar o início da linha (Atendimento, Guia, Data, Hora)
-    # Ex: 63974312 63974312 13/01/2026 15:14
-    head_re = re.compile(r"(\d{8})\s+(\d{8})\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})")
-    
-    # Regex para capturar o padrão de valor monetário brasileiro (ex: 1.234,56 ou 148,60)
-    val_re = re.compile(r"(\d{1,3}(?:\.\d{3})*,\d{2})")
-
-    def parse_by_text() -> pd.DataFrame:
-        reader = PdfReader(open(pdf_path, "rb"))
-        full_content = []
-        
-        for page in reader.pages:
-            text = page.extract_text()
-            if not text: continue
-            
-            # O PDF da AMHP separa as colunas por quebras de linha estranhas. 
-            # Vamos limpar excessos mas manter espaços.
-            lines = text.split('\n')
-            full_content.extend(lines)
-
-        big_text = " ".join(full_content)
-        big_text = _normalize_ws(big_text)
-
-        # 1. Identificar todos os "Heads" de atendimentos (Atendimento + Guia + Data + Hora)
-        starts = list(head_re.finditer(big_text))
-        parsed = []
-
-        for i in range(len(starts)):
-            # Define o bloco de texto entre este atendimento e o próximo
-            start_pos = starts[i].start()
-            end_pos = starts[i+1].start() if i+1 < len(starts) else len(big_text)
-            block = big_text[start_pos:end_pos]
-
-            # Extrair os dados do Cabeçalho
-            atendimento, guia, data, hora = starts[i].groups()
-            
-            # Remover o cabeçalho do bloco para sobrar o resto (Tipo Guia, Operadora, Beneficiário, etc)
-            rest_of_block = big_text[starts[i].end():end_pos].strip()
-
-            # O valor total está sempre no final do bloco (antes do próximo atendimento)
-            valor_matches = list(val_re.finditer(rest_of_block))
-            valor_total = valor_matches[-1].group(0) if valor_matches else "0,00"
-            
-            # Limpar o bloco para pegar o miolo
-            if valor_matches:
-                miolo = rest_of_block[:valor_matches[-1].start()].strip()
-            else:
-                miolo = rest_of_block
-
-            # Lógica de extração do "Miolo": [Tipo Guia] [Operadora] [Matricula] [Beneficiário] [Prestador] [Credenciado]
-            # No AMHP, o Tipo de Guia costuma ser a primeira palavra (Consulta, SP/SADT, etc)
-            words = miolo.split()
-            tipo_guia = words[0] if words else ""
-            
-            # Identificar Prestador e Credenciado (Geralmente começam com códigos tipo 014406-...)
-            codes = list(re.finditer(r"\d{5,6}-", miolo))def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "text", debug: bool = False) -> pd.DataFrame:
-    from PyPDF2 import PdfReader
-    import re
-
-    def _normalize_ws(s: str) -> str:
-        return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip()
-
     # Regex para capturar o início do registro (Atendimento e Guia são iguais e têm 8 dígitos)
     # Ex: 63974312 63974312 13/01/2026
     record_start_re = re.compile(r"(\d{8})\s+(\d{8})\s+(\d{2}/\d{2}/\d{4})")
