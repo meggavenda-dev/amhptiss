@@ -199,40 +199,112 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "text", debug: bool 
             tipo_guia = words[0] if words else ""
             
             # Identificar Prestador e Credenciado (Geralmente começam com códigos tipo 014406-...)
-            codes = list(re.finditer(r"\d{5,6}-", miolo))
-            credenciado = ""
+            codes = list(re.finditer(r"\d{5,6}-", miolo))def parse_pdf_to_atendimentos_df(pdf_path: str, mode: str = "text", debug: bool = False) -> pd.DataFrame:
+    from PyPDF2 import PdfReader
+    import re
+
+    def _normalize_ws(s: str) -> str:
+        return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip()
+
+    # Regex para capturar o início do registro (Atendimento e Guia são iguais e têm 8 dígitos)
+    # Ex: 63974312 63974312 13/01/2026
+    record_start_re = re.compile(r"(\d{8})\s+(\d{8})\s+(\d{2}/\d{2}/\d{4})")
+    val_re = re.compile(r"(\d{1,3}(?:\.\d{3})*,\d{2})")
+
+    def parse_by_text() -> pd.DataFrame:
+        reader = PdfReader(open(pdf_path, "rb"))
+        full_text = ""
+        for page in reader.pages:
+            full_text += page.extract_text() + " "
+        
+        big = _normalize_ws(full_text)
+        
+        # Identifica onde começa cada atendimento
+        matches = list(record_start_re.finditer(big))
+        parsed = []
+
+        for i in range(len(matches)):
+            start_idx = matches[i].start()
+            end_idx = matches[i+1].start() if i+1 < len(matches) else len(big)
+            chunk = big[start_idx:end_idx].strip()
+
+            # Extração básica do cabeçalho
+            atend, guia, data = matches[i].groups()
+            
+            # Tenta pegar a hora logo após a data
+            hora_match = re.search(r"(\d{2}:\d{2})", chunk)
+            hora = hora_match.group(1) if hora_match else ""
+
+            # Extração do Valor (último valor monetário do bloco)
+            valores = val_re.findall(chunk)
+            valor_total = valores[-1] if valores else "0,00"
+
+            # --- Lógica para o Miolo (Tipo Guia, Operadora, Beneficiário, Prestador, Credenciado) ---
+            # Removemos o que já pegamos para limpar a busca
+            miolo = chunk.replace(atend, "").replace(guia, "").replace(data, "").replace(valor_total, "").strip()
+            
+            # Identifica códigos de Prestador/Credenciado (padrão 000000-)
+            codes = list(re.finditer(r"(\d{5,7}-)", miolo))
+            
             prestador = ""
+            credenciado = ""
             
             if len(codes) >= 2:
-                # O último código costuma ser o Prestador, o penúltimo o Credenciado
-                cred_idx = codes[-2].start()
-                prest_idx = codes[-1].start()
-                credenciado = miolo[cred_idx:prest_idx].strip()
-                prestador = miolo[prest_idx:].strip()
-                # O que sobrar entre o Tipo de Guia e o Credenciado é Operadora + Beneficiário
-                meio = miolo[len(tipo_guia):cred_idx].strip()
+                # O AMHP costuma colocar o Prestador antes do Credenciado ou vice-versa no texto extraído
+                # Mas quase sempre o penúltimo código é o Prestador e o último é o Credenciado (ou o contrário)
+                # Vamos capturar os blocos de texto que começam com esses códigos
+                p1_idx = codes[-2].start()
+                p2_idx = codes[-1].start()
+                
+                # Geralmente o Credenciado é a Clínica Diogenes Serquiz (014406)
+                # Vamos identificar pelo conteúdo
+                parte_a = miolo[p1_idx:p2_idx].strip()
+                parte_b = miolo[p2_idx:].strip()
+                
+                if "014406" in parte_a:
+                    credenciado = parte_a
+                    prestador = parte_b
+                else:
+                    prestador = parte_a
+                    credenciado = parte_b
+                
+                miolo_restante = miolo[:p1_idx].strip()
             else:
-                meio = miolo[len(tipo_guia):].strip()
+                miolo_restante = miolo
 
-            # Separar Operadora de Beneficiário (A operadora costuma ter o código entre parênteses)
-            operadora_match = re.search(r"(.*?\(\d+\))", meio)
-            if operadora_match:
-                operadora = operadora_match.group(1).strip()
-                beneficiario = meio[operadora_match.end():].strip()
-            else:
-                # Fallback caso não ache parênteses: pega as 2 primeiras palavras como operadora
-                parts_meio = meio.split()
-                operadora = " ".join(parts_meio[:2]) if len(parts_meio) > 2 else ""
-                beneficiario = " ".join(parts_meio[2:]) if len(parts_meio) > 2 else ""
+            # Tipo de Guia e Operadora (Consulta, SP/SADT, etc)
+            tipos_conhecidos = ["Consulta", "SP/SADT", "Não TISS", "SADT"]
+            tipo_guia = ""
+            for t in tipos_conhecidos:
+                if t in miolo_restante:
+                    tipo_guia = t
+                    break
+            
+            # O que sobrar no miolo_restante costuma ser "Operadora + Matrícula + Beneficiário"
+            # Ex: "BACEN(104) 8787234X030501 Alynne Marques Silva"
+            info_ben = miolo_restante.replace(tipo_guia, "").replace(hora, "").strip()
+            
+            # Regex para pegar a Operadora com código: ex BACEN(104)
+            ope_match = re.search(r"([A-Z\s\-\.]+\(\w+\))", info_ben)
+            operadora = ope_match.group(1) if ope_match else ""
+            
+            # O restante após a operadora
+            pos_ope = info_ben.find(operadora) + len(operadora) if operadora else 0
+            sobra = info_ben[pos_ope:].strip()
+            
+            # Se houver um número longo, é a matrícula
+            mat_match = re.search(r"(\d{5,})", sobra)
+            matricula = mat_match.group(1) if mat_match else ""
+            beneficiario = sobra.replace(matricula, "").strip()
 
             parsed.append({
-                "Atendimento": atendimento,
+                "Atendimento": atend,
                 "NrGuia": guia,
                 "Realizacao": data,
                 "Hora": hora,
                 "TipoGuia": tipo_guia,
                 "Operadora": operadora,
-                "Matricula": "", # A matrícula muitas vezes se funde com o nome, deixamos vazio ou extraímos via regex se houver padrão fixo
+                "Matricula": matricula,
                 "Beneficiario": beneficiario,
                 "Credenciado": credenciado,
                 "Prestador": prestador,
