@@ -142,93 +142,155 @@ def parse_pdf_to_atendimentos_df(pdf_path: str, debug: bool = False) -> pd.DataF
     import re
 
     def _normalize_ws(s: str) -> str:
-        return re.sub(r"\s+", " ", s.replace("\u00A0", " ")).strip()
+        s = s.replace("\u00A0", " ")
+        s = re.sub(r"[ \t]+", " ", s)
+        return s.strip()
 
+    # Read all text
     reader = PdfReader(open(pdf_path, "rb"))
-    all_lines = []
+    lines = []
     for page in reader.pages:
-        txt = page.extract_text()
-        if txt:
-            all_lines.extend(txt.splitlines())
+        txt = page.extract_text() or ""
+        lines.extend(txt.splitlines())
 
-    # --- 1) Limpar cabeçalhos/rodapés ---
-    clean_lines = []
-    for line in all_lines:
-        if "Atendimentos Realizados Sintético" in line: continue
-        if "Emitido por" in line and "Página" in line: continue
-        clean_lines.append(line.strip())
+    # Remove headers/footers/artifacts
+    junk_markers = [
+        "Atendimentos Realizados Sintético",
+        "Emitido por", "Página", "amhp", "SOLUÇÕES INTEGRADAS",
+        "Associação dos Médicos de Hospitais Privados- DF",
+        "Atendimento Nr. Guia Prontuário Realização Hora Tipo de Guia Operadora Matrícula Beneficiário Credenciado Prestador Valor Total",
+    ]
+    clean = []
+    for ln in lines:
+        ln2 = ln.strip()
+        if any(m in ln2 for m in junk_markers):
+            continue
+        if not ln2:
+            continue
+        clean.append(ln2)
 
-    # --- 2) Tentar modo tabela (linhas com 11+ colunas separadas por espaços) ---
-    rows = []
-    for line in clean_lines:
-        parts = re.split(r"\s{2,}", line.strip())
-        if len(parts) >= 11 and parts[0].isdigit() and len(parts[0]) == 8:
-            rows.append(parts[:11])
+    big = _normalize_ws(" ".join(clean))
 
-    if rows:
-        df = pd.DataFrame(rows, columns=TARGET_COLS)
-        return sanitize_df(df)
+    # Row anchors
+    row_re = re.compile(r"(\d{8})\s+(\d{8})\s+(\d{2}/\d{2}/\d{4})")
+    rows = list(row_re.finditer(big))
 
-    # --- 3) Se não funcionar, cair para modo texto corrido ---
-    record_start_re = re.compile(r"(\d{8})\s+(\d{8})\s+(\d{2}/\d{2}/\d{4})")
-    val_re = re.compile(r"(\d{1,3}(?:\.\d{3})*,\d{2})")
-    code_re = re.compile(r"(\d{5,7}-)")
+    if debug:
+        print(f"[DEBUG] Found {len(rows)} row anchors")
 
-    big = _normalize_ws(" ".join(clean_lines))
-    matches = list(record_start_re.finditer(big))
     parsed = []
+    # Helper regexes
+    hora_re       = re.compile(r"\b(\d{2}:\d{2})\b")
+    tipo_choices  = ["Consulta", "SP/SADT", "Não TISS", "SADT"]
+    operadora_re  = re.compile(r"([A-ZÁÉÍÓÚÂÊÔÃÕÇ0-9\s\-/]+\( *\d+ *\))")
+    matricula_re  = re.compile(r"\b([A-Z0-9/.\-]{5,})\b")
+    prov_block_re = re.compile(r"(\d{5,6}-[^\d]+?(?=(?:\s\d{5,6}-)|$))")
+    money_re      = re.compile(r"(\d{1,3}(?:\.\d{3})*,\d{2})")
 
-    for i in range(len(matches)):
-        start_idx = matches[i].start()
-        end_idx = matches[i+1].start() if i+1 < len(matches) else len(big)
-        chunk = big[start_idx:end_idx].strip()
+    for i, m in enumerate(rows):
+        start = m.start()
+        end   = rows[i+1].start() if i+1 < len(rows) else len(big)
+        chunk = big[start:end].strip()
 
-        atend, guia, data = matches[i].groups()
-        hora_m = re.search(r"(\d{2}:\d{2})", chunk)
+        atendimento, nrguia, realizacao = m.groups()
+
+        # Hora
+        hora_m = hora_re.search(chunk)
         hora = hora_m.group(1) if hora_m else ""
 
-        valores = val_re.findall(chunk)
-        valor_total = valores[-1] if valores else "0,00"
+        # TipoGuia
+        tipo_guia = ""
+        for t in tipo_choices:
+            idx = chunk.find(t)
+            if idx != -1:
+                if not tipo_guia or idx < chunk.find(tipo_guia):
+                    tipo_guia = t
 
-        miolo = chunk.replace(atend, "").replace(guia, "").replace(data, "").replace(valor_total, "").strip()
-        codes = list(code_re.finditer(miolo))
-        prestador, credenciado = "", ""
-        miolo_restante = miolo
+        # Operadora (nearest after TipoGuia)
+        operadora = ""
+        if tipo_guia:
+            after_tipo = chunk[chunk.find(tipo_guia) + len(tipo_guia):]
+            op_m = operadora_re.search(after_tipo)
+            operadora = op_m.group(1).strip() if op_m else ""
+        else:
+            op_m = operadora_re.search(chunk)
+            operadora = op_m.group(1).strip() if op_m else ""
 
-        if len(codes) >= 2:
-            p1, p2 = codes[-2].start(), codes[-1].start()
-            parte_a = miolo[p1:p2].strip()
-            parte_b = miolo[p2:].strip()
-            if "014406" in parte_a:
-                credenciado, prestador = parte_a, parte_b
+        # Matrícula (next token after operadora)
+        matricula = ""
+        if operadora:
+            after_op = chunk[chunk.find(operadora) + len(operadora):]
+            mat_m = matricula_re.search(after_op)
+            matricula = mat_m.group(1) if mat_m else ""
+        else:
+            mat_m = matricula_re.search(chunk)
+            matricula = mat_m.group(1) if mat_m else ""
+
+        # Beneficiário: text between matrícula and first provider block
+        beneficiario = ""
+        credenciado  = ""
+        prestador    = ""
+
+        # Find provider blocks
+        prov_blocks = list(prov_block_re.finditer(chunk))
+        # Compute beneficiary span
+        if matricula:
+            mat_pos = chunk.find(matricula)
+            ben_start = mat_pos + len(matricula)
+        else:
+            # fallback: after operadora or tipo
+            if operadora:
+                ben_start = chunk.find(operadora) + len(operadora)
+            elif tipo_guia:
+                ben_start = chunk.find(tipo_guia) + len(tipo_guia)
             else:
-                prestador, credenciado = parte_a, parte_b
-            miolo_restante = miolo[:p1].strip()
-        elif len(codes) == 1:
-            prestador = miolo[codes[0].start():].strip()
-            miolo_restante = miolo[:codes[0].start()].strip()
+                ben_start = 0
 
-        tipos = ["Consulta", "SP/SADT", "Não TISS", "SADT"]
-        tipo_guia = next((t for t in tipos if t in miolo_restante), "")
+        if prov_blocks:
+            ben_end = prov_blocks[0].start()
+            beneficiario = _normalize_ws(chunk[ben_start:ben_end])
+            # Map provider blocks
+            if len(prov_blocks) >= 2:
+                credenciado = _normalize_ws(prov_blocks[0].group(0))
+                prestador   = _normalize_ws(prov_blocks[1].group(0))
+            else:
+                prestador   = _normalize_ws(prov_blocks[0].group(0))
+        else:
+            # No provider blocks found—take until last money or end
+            tail_money = list(money_re.finditer(chunk))
+            ben_end = tail_money[-1].start() if tail_money else len(chunk)
+            beneficiario = _normalize_ws(chunk[ben_start:ben_end])
 
-        info = miolo_restante.replace(tipo_guia, "").replace(hora, "").strip()
-        ope_match = re.search(r"([A-ZÁÉÍÓÚÂÊÔÃÕÇ\s\-/]+\( *\d+ *\))", info)
-        operadora = ope_match.group(1) if ope_match else ""
-
-        sobra = info.replace(operadora, "").strip()
-        mat_match = re.search(r"([A-Z0-9]{5,})", sobra)
-        matricula = mat_match.group(1) if mat_match else ""
-        beneficiario = sobra.replace(matricula, "").strip()
+        # ValorTotal: last money near the end
+        valor_total = "0,00"
+        tail = chunk[-80:]  # look at the tail to avoid earlier amounts
+        tail_money = money_re.findall(tail)
+        if tail_money:
+            valor_total = tail_money[-1]
+        else:
+            # fallback: last money anywhere
+            all_money = money_re.findall(chunk)
+            if all_money:
+                valor_total = all_money[-1]
 
         parsed.append({
-            "Atendimento": atend, "NrGuia": guia, "Realizacao": data, "Hora": hora,
-            "TipoGuia": tipo_guia, "Operadora": operadora, "Matricula": matricula,
-            "Beneficiario": beneficiario, "Credenciado": credenciado,
-            "Prestador": prestador, "ValorTotal": valor_total
+            "Atendimento": atendimento,
+            "NrGuia": nrguia,
+            "Realizacao": realizacao,
+            "Hora": hora,
+            "TipoGuia": tipo_guia,
+            "Operadora": operadora,
+            "Matricula": matricula,
+            "Beneficiario": beneficiario,
+            "Credenciado": credenciado,
+            "Prestador": prestador,
+            "ValorTotal": valor_total,
         })
 
     df = pd.DataFrame(parsed)
-    return ensure_atendimentos_schema(sanitize_df(df))
+    df = sanitize_df(df)
+    df = ensure_atendimentos_schema(df)
+    return df
 
 # ========= Sidebar =========
 with st.sidebar:
